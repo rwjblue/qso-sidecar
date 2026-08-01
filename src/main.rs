@@ -6,6 +6,7 @@ mod model;
 mod naqp;
 mod naqp_catalog;
 mod rbn;
+mod rbn_locality;
 mod storage;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -90,6 +91,15 @@ struct Args {
         env = "QSO_SIDECAR_PREFERRED_RBN_SPOTTERS"
     )]
     preferred_rbn_spotters: Vec<String>,
+    /// Maidenhead grid used to select nearby RBN receiver sites.
+    #[arg(long, env = "QSO_SIDECAR_STATION_GRID")]
+    station_grid: Option<String>,
+    /// RBN receiver scope. Defaults to nearby with a station grid, otherwise all.
+    #[arg(long, value_enum, env = "QSO_SIDECAR_RBN_SKIMMER_SCOPE")]
+    rbn_skimmer_scope: Option<rbn_locality::SkimmerScope>,
+    /// Number of distinct nearby RBN receiver sites selected per band.
+    #[arg(long, default_value_t = 3, env = "QSO_SIDECAR_RBN_NEAREST_SITES")]
+    rbn_nearest_sites: usize,
     /// Override the LoFi API base for development.
     #[arg(
         long,
@@ -171,15 +181,18 @@ impl Args {
             preferred_spotters,
         })
     }
+
+    fn rbn_locality(&self) -> Result<rbn_locality::RbnLocality> {
+        rbn_locality::RbnLocality::new(
+            self.station_grid.as_deref(),
+            self.rbn_skimmer_scope,
+            self.rbn_nearest_sites,
+        )
+    }
 }
 
 fn normalize_spotter(spotter: &str) -> String {
-    spotter
-        .trim()
-        .trim_end_matches("-#")
-        .trim_end_matches('#')
-        .trim_end_matches('-')
-        .to_ascii_uppercase()
+    rbn_locality::normalize_spotter(spotter)
 }
 
 fn validate_rbn_config(rbn_enabled: bool, call: Option<&str>) -> Result<()> {
@@ -246,6 +259,7 @@ struct Runtime {
     spot_policy: SpotPolicy,
     demo: bool,
     goals: OperatorGoals,
+    rbn_locality: rbn_locality::RbnLocality,
 }
 
 #[derive(Debug, Serialize)]
@@ -256,6 +270,9 @@ struct PublicState {
     score: naqp::Score,
     multiplier_matrix: Vec<MatrixRow>,
     spots: Vec<Spot>,
+    all_spots: Vec<Spot>,
+    nearby_spots: Vec<Spot>,
+    rbn_locality: rbn_locality::PublicLocality,
     operations: Vec<Operation>,
     selected_operation: Option<String>,
     source: String,
@@ -445,6 +462,7 @@ impl Runtime {
                 spot_policy,
                 demo: false,
                 goals: restored.goals,
+                rbn_locality: rbn_locality::RbnLocality::default(),
             };
         }
         Self {
@@ -467,6 +485,7 @@ impl Runtime {
             spot_policy,
             demo: false,
             goals: OperatorGoals::default(),
+            rbn_locality: rbn_locality::RbnLocality::default(),
         }
     }
 
@@ -499,7 +518,13 @@ impl Runtime {
             .filter(|qso| !qso.deleted)
             .max_by_key(|qso| qso.timestamp)
             .and_then(|qso| qso.band);
-        let spots = self.fresh_spots(generated_at, current_band);
+        let all_spots = self.fresh_spots(generated_at, current_band, false);
+        let nearby_spots = self.fresh_spots(generated_at, current_band, true);
+        let spots = if self.rbn_locality.effective_scope() == rbn_locality::SkimmerScope::Nearby {
+            nearby_spots.clone()
+        } else {
+            all_spots.clone()
+        };
         let multiplier_matrix = build_multiplier_matrix(&score, &spots);
         let mut source_policy = self.source_policy.clone();
         source_policy.set_enabled(
@@ -548,6 +573,9 @@ impl Runtime {
             score,
             multiplier_matrix,
             spots,
+            all_spots,
+            nearby_spots,
+            rbn_locality: self.rbn_locality.public(),
             operations: self.operations.clone(),
             selected_operation: self.selected_operation.clone(),
             source: self.source.clone(),
@@ -580,7 +608,12 @@ impl Runtime {
         }
     }
 
-    fn fresh_spots(&self, now: DateTime<Utc>, current_band: Option<Band>) -> Vec<Spot> {
+    fn fresh_spots(
+        &self,
+        now: DateTime<Utc>,
+        current_band: Option<Band>,
+        nearby: bool,
+    ) -> Vec<Spot> {
         let evidence = station_evidence(
             self.qsos.values(),
             self.call_history.values(),
@@ -592,8 +625,26 @@ impl Runtime {
         let mut spots: Vec<_> = self
             .spots
             .iter()
-            .filter(|spot| now - spot.time <= self.spot_policy.ttl)
-            .cloned()
+            .filter_map(|spot| {
+                if nearby {
+                    let local_time = spot.local_time?;
+                    if now - local_time > self.spot_policy.ttl {
+                        return None;
+                    }
+                    let mut local = spot.clone();
+                    local.time = local_time;
+                    local.frequency_khz = spot.local_frequency_khz?;
+                    local.spotter = spot.local_spotter.clone()?;
+                    local.snr_db = spot.local_snr_db;
+                    local.best_snr_db = spot.local_best_snr_db;
+                    local.speed_wpm = spot.local_speed_wpm;
+                    Some(local)
+                } else if now - spot.time <= self.spot_policy.ttl {
+                    Some(spot.clone())
+                } else {
+                    None
+                }
+            })
             .collect();
         for spot in &mut spots {
             (spot.class, spot.predicted_multiplier) =
@@ -604,9 +655,19 @@ impl Runtime {
                 spot.stale,
                 current_band.is_some_and(|band| spot.band != band),
                 spot_class_priority(spot.class),
+                nearby.then_some(std::cmp::Reverse(spot.local_sites.len())),
+                nearby.then_some(spot.nearest_local_km.unwrap_or(u32::MAX)),
                 !spot.preferred_spotter,
-                std::cmp::Reverse(spot.spotters.len()),
-                std::cmp::Reverse(spot.reports),
+                std::cmp::Reverse(if nearby {
+                    spot.local_spotters.len()
+                } else {
+                    spot.spotters.len()
+                }),
+                std::cmp::Reverse(if nearby {
+                    spot.local_reports
+                } else {
+                    spot.reports
+                }),
                 std::cmp::Reverse(spot.time),
             )
         });
@@ -1140,6 +1201,16 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     validate_rbn_config(args.rbn, args.call.as_deref())?;
     let spot_policy = args.spot_policy()?;
+    let mut rbn_locality = args.rbn_locality()?;
+    let locality_cache = rbn_locality::CatalogCache::for_app()?;
+    if !args.rbn {
+        rbn_locality.mark_feed_disabled();
+    }
+    if args.rbn
+        && let Err(error) = rbn_locality.install_cached(&locality_cache, Utc::now())
+    {
+        warn!(%error, "could not restore cached RBN node directory");
+    }
     let lofi = lofi::LofiClient::new(args.lofi_base)?;
     let store = storage::StateStore::for_app()?;
     let restored = match store.load() {
@@ -1151,11 +1222,12 @@ async fn main() -> Result<()> {
     };
     let (updates, _) = broadcast::channel(32);
     let (shutdown, _) = broadcast::channel(1);
-    let runtime = if args.demo {
+    let mut runtime = if args.demo {
         demo_runtime(args.rbn, spot_policy, args.demo_scenario)
     } else {
         Runtime::normal(args.rbn, spot_policy, restored)
     };
+    runtime.rbn_locality = rbn_locality;
     let state = AppState {
         runtime: Arc::new(RwLock::new(runtime)),
         updates,
@@ -1166,6 +1238,7 @@ async fn main() -> Result<()> {
 
     tokio::spawn(run_lofi_sync(state.clone()));
     if args.rbn {
+        spawn_locality_refresh(state.clone(), locality_cache);
         spawn_cluster(state.clone(), args.cluster, args.call);
     }
 
@@ -1465,6 +1538,7 @@ struct DemoRequest {
 async fn toggle_demo(State(state): State<AppState>, Json(request): Json<DemoRequest>) -> Response {
     let spots_enabled = state.runtime.read().await.spots_enabled();
     let mut runtime = state.runtime.write().await;
+    let rbn_locality = runtime.rbn_locality.clone();
     if request.enabled {
         *runtime = demo_runtime(
             spots_enabled,
@@ -1483,6 +1557,7 @@ async fn toggle_demo(State(state): State<AppState>, Json(request): Json<DemoRequ
         };
         *runtime = Runtime::normal(spots_enabled, runtime.spot_policy.clone(), restored);
     }
+    runtime.rbn_locality = rbn_locality;
     drop(runtime);
     state.updates.send(()).ok();
     Json(json!({"ok": true})).into_response()
@@ -1634,6 +1709,24 @@ fn spawn_cluster(state: AppState, address: String, login_call: Option<String>) {
     });
 }
 
+fn spawn_locality_refresh(state: AppState, cache: rbn_locality::CatalogCache) {
+    tokio::spawn(async move {
+        loop {
+            let mut locality = state.runtime.read().await.rbn_locality.clone();
+            match rbn_locality::refresh(&mut locality, &cache).await {
+                Ok(()) => state.runtime.write().await.rbn_locality = locality,
+                Err(error) => {
+                    warn!(%error, "RBN node directory refresh failed");
+                    let mut runtime = state.runtime.write().await;
+                    runtime.rbn_locality.mark_unavailable(format!("{error:#}"));
+                }
+            }
+            state.updates.send(()).ok();
+            tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+        }
+    });
+}
+
 fn update_cluster_status(runtime: &mut Runtime, state: rbn::ConnectionState, message: String) {
     runtime.spot_status = message;
     if state.candidates_are_stale() {
@@ -1644,6 +1737,11 @@ fn update_cluster_status(runtime: &mut Runtime, state: rbn::ConnectionState, mes
 }
 
 fn merge_spot(runtime: &mut Runtime, raw: rbn::RawSpot) {
+    let local_match = runtime.rbn_locality.match_spotter(raw.band, &raw.spotter);
+    let preferred = runtime
+        .spot_policy
+        .preferred_spotters
+        .contains(&normalize_spotter(&raw.spotter));
     runtime
         .spots
         .retain(|spot| raw.time - spot.time <= runtime.spot_policy.ttl);
@@ -1654,10 +1752,7 @@ fn merge_spot(runtime: &mut Runtime, raw: rbn::RawSpot) {
             && (spot.frequency_khz - raw.frequency_khz).abs() <= runtime.spot_policy.dedupe_khz
     }) {
         existing.spotters.insert(raw.spotter.clone());
-        existing.preferred_spotter |= runtime
-            .spot_policy
-            .preferred_spotters
-            .contains(&normalize_spotter(&raw.spotter));
+        existing.preferred_spotter |= preferred;
         existing.best_snr_db = match (existing.best_snr_db, raw.snr_db) {
             (Some(old), Some(new)) => Some(old.max(new)),
             (old, new) => old.or(new),
@@ -1665,19 +1760,48 @@ fn merge_spot(runtime: &mut Runtime, raw: rbn::RawSpot) {
         if raw.time >= existing.time {
             existing.time = raw.time;
             existing.frequency_khz = raw.frequency_khz;
-            existing.spotter = raw.spotter;
+            existing.spotter = raw.spotter.clone();
             existing.snr_db = raw.snr_db.or(existing.snr_db);
             existing.speed_wpm = raw.speed_wpm.or(existing.speed_wpm);
         }
         existing.reports += 1;
         existing.stale = false;
+        if let Some(local_match) = local_match {
+            existing.local_spotters.insert(raw.spotter.clone());
+            existing.local_sites.insert(local_match.site_grid);
+            existing.nearest_local_km = Some(
+                existing
+                    .nearest_local_km
+                    .map_or(local_match.distance_km, |old| {
+                        old.min(local_match.distance_km)
+                    }),
+            );
+            existing.local_best_snr_db = match (existing.local_best_snr_db, raw.snr_db) {
+                (Some(old), Some(new)) => Some(old.max(new)),
+                (old, new) => old.or(new),
+            };
+            if existing.local_time.is_none_or(|time| raw.time >= time) {
+                existing.local_time = Some(raw.time);
+                existing.local_frequency_khz = Some(raw.frequency_khz);
+                existing.local_spotter = Some(raw.spotter);
+                existing.local_snr_db = raw.snr_db.or(existing.local_snr_db);
+                existing.local_speed_wpm = raw.speed_wpm.or(existing.local_speed_wpm);
+            }
+            existing.local_reports += 1;
+        }
         return;
     }
     let (class, predicted_multiplier) = classify_spot(runtime, &raw.call, raw.band);
-    let preferred_spotter = runtime
-        .spot_policy
-        .preferred_spotters
-        .contains(&normalize_spotter(&raw.spotter));
+    let local_time = local_match.as_ref().map(|_| raw.time);
+    let local_frequency_khz = local_match.as_ref().map(|_| raw.frequency_khz);
+    let local_spotter = local_match.as_ref().map(|_| raw.spotter.clone());
+    let local_spotters = local_match
+        .as_ref()
+        .map_or_else(BTreeSet::new, |_| BTreeSet::from([raw.spotter.clone()]));
+    let local_sites = local_match.as_ref().map_or_else(BTreeSet::new, |site| {
+        BTreeSet::from([site.site_grid.clone()])
+    });
+    let nearest_local_km = local_match.as_ref().map(|site| site.distance_km);
     runtime.spots.push_front(Spot {
         id: format!(
             "{}-{}-{}",
@@ -1697,8 +1821,18 @@ fn merge_spot(runtime: &mut Runtime, raw: rbn::RawSpot) {
         class,
         predicted_multiplier,
         reports: 1,
-        preferred_spotter,
+        preferred_spotter: preferred,
         stale: false,
+        local_time,
+        local_frequency_khz,
+        local_spotter,
+        local_spotters,
+        local_sites,
+        local_snr_db: local_match.as_ref().and(raw.snr_db),
+        local_best_snr_db: local_match.as_ref().and(raw.snr_db),
+        local_speed_wpm: local_match.as_ref().and(raw.speed_wpm),
+        local_reports: u32::from(local_match.is_some()),
+        nearest_local_km,
     });
     runtime.spots.truncate(runtime.spot_policy.capacity);
 }
@@ -1984,6 +2118,7 @@ fn demo_runtime(spots_enabled: bool, spot_policy: SpotPolicy, scenario: DemoScen
             qso: Some(300),
             score: Some(50_000),
         },
+        rbn_locality: rbn_locality::RbnLocality::default(),
     };
     match scenario {
         DemoScenario::Normal => {}
@@ -2160,6 +2295,16 @@ fn demo_spot(
         reports,
         preferred_spotter: false,
         stale: false,
+        local_time: None,
+        local_frequency_khz: None,
+        local_spotter: None,
+        local_spotters: BTreeSet::new(),
+        local_sites: BTreeSet::new(),
+        local_snr_db: None,
+        local_best_snr_db: None,
+        local_speed_wpm: None,
+        local_reports: 0,
+        nearest_local_km: None,
     }
 }
 
@@ -2710,6 +2855,61 @@ mod tests {
     }
 
     #[test]
+    fn distant_reports_do_not_create_or_refresh_nearby_candidates() {
+        let now = Utc::now();
+        let mut runtime = Runtime::normal(false, SpotPolicy::default(), None);
+        runtime.rbn_locality = rbn_locality::RbnLocality::new(Some("FN31PR"), None, 1).unwrap();
+        runtime.rbn_locality.install_test_nodes(
+            &[
+                ("LOCAL", "FN31JG", &[Band::B20]),
+                ("DISTANT", "EM00AA", &[Band::B20]),
+            ],
+            now,
+        );
+
+        merge_spot(
+            &mut runtime,
+            raw_spot("K1ABC", 14_025.0, now, "LOCAL-#", 10),
+        );
+        merge_spot(
+            &mut runtime,
+            raw_spot(
+                "K1ABC",
+                14_025.5,
+                now + chrono::Duration::seconds(20),
+                "DISTANT-#",
+                30,
+            ),
+        );
+        merge_spot(
+            &mut runtime,
+            raw_spot(
+                "K2REMOTE",
+                14_026.0,
+                now + chrono::Duration::seconds(25),
+                "DISTANT-#",
+                40,
+            ),
+        );
+
+        let all = runtime.fresh_spots(now + chrono::Duration::seconds(25), None, false);
+        let nearby = runtime.fresh_spots(now + chrono::Duration::seconds(25), None, true);
+        assert_eq!(all.len(), 2);
+        assert_eq!(nearby.len(), 1);
+        assert_eq!(nearby[0].call, "K1ABC");
+        assert_eq!(nearby[0].frequency_khz, 14_025.0);
+        assert_eq!(nearby[0].snr_db, Some(10));
+        assert_eq!(nearby[0].reports, 2);
+        assert_eq!(nearby[0].local_reports, 1);
+        assert_eq!(nearby[0].local_sites, BTreeSet::from(["FN31JG".into()]));
+        assert!(
+            runtime
+                .fresh_spots(now + chrono::Duration::minutes(11), None, true)
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn dedupe_respects_frequency_and_time_windows() {
         let mut runtime = Runtime::normal(false, SpotPolicy::default(), None);
         let now = Utc::now();
@@ -2763,7 +2963,7 @@ mod tests {
         assert_eq!(runtime.spots.len(), 25);
         assert!(
             runtime
-                .fresh_spots(now + chrono::Duration::seconds(61), None)
+                .fresh_spots(now + chrono::Duration::seconds(61), None, false)
                 .is_empty()
         );
     }
@@ -2809,7 +3009,7 @@ mod tests {
         merge_spot(&mut runtime, raw_spot("K1ABC", 14_025.1, now, "K3LR-#", 20));
         merge_spot(&mut runtime, raw_spot("W7RN", 14_026.1, now, "WZ7I-#", 10));
 
-        let spots = runtime.fresh_spots(now, Some(Band::B20));
+        let spots = runtime.fresh_spots(now, Some(Band::B20), false);
         assert_eq!(spots[0].call, "W7RN");
         assert!(spots[0].preferred_spotter);
     }

@@ -547,6 +547,26 @@ pub struct Spot {
     pub reports: u32,
     pub preferred_spotter: bool,
     pub stale: bool,
+    #[serde(default)]
+    pub local_time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub local_frequency_khz: Option<f64>,
+    #[serde(default)]
+    pub local_spotter: Option<String>,
+    #[serde(default)]
+    pub local_spotters: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub local_sites: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub local_snr_db: Option<i16>,
+    #[serde(default)]
+    pub local_best_snr_db: Option<i16>,
+    #[serde(default)]
+    pub local_speed_wpm: Option<u16>,
+    #[serde(default)]
+    pub local_reports: u32,
+    #[serde(default)]
+    pub nearest_local_km: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

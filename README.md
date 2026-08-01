@@ -197,6 +197,20 @@ QSO_SIDECAR_CALL=N1RWJ mise run start -- --rbn \
   --preferred-rbn-spotters WZ7I,K3LR
 ```
 
+For a geographically relevant candidate queue, provide the station's Maidenhead grid.
+Sidecar downloads RBN's active-node directory and, independently for each contest band,
+uses reports from the three nearest distinct receiver sites. The dashboard shows the
+derived coverage distance and can switch between **Nearby** and **All RBN** without
+changing the Assisted entry warning:
+
+```bash
+QSO_SIDECAR_CALL=N1RWJ mise run start -- --rbn --station-grid FN31PR
+```
+
+Multiple skimmer processes at the same advertised grid count as one receiver site for
+selection. If the node directory is unavailable, Sidecar uses a recent cached copy or
+visibly falls back to the full feed; the station grid is never sent to RBN.
+
 See [`docs/rbn-pipeline.md`](docs/rbn-pipeline.md) for aggregation, expiry, ranking, and
 the classification evidence policy.
 
@@ -215,6 +229,9 @@ CLI flags also have environment-variable equivalents:
 | `--spot-dedupe-khz` | `QSO_SIDECAR_SPOT_DEDUPE_KHZ` | `1.0` |
 | `--spot-capacity` | `QSO_SIDECAR_SPOT_CAPACITY` | `200` |
 | `--preferred-rbn-spotters` | `QSO_SIDECAR_PREFERRED_RBN_SPOTTERS` | none |
+| `--station-grid` | `QSO_SIDECAR_STATION_GRID` | none |
+| `--rbn-skimmer-scope` | `QSO_SIDECAR_RBN_SKIMMER_SCOPE` | `nearby` with a grid, otherwise `all` |
+| `--rbn-nearest-sites` | `QSO_SIDECAR_RBN_NEAREST_SITES` | `3` |
 | `--demo` | `QSO_SIDECAR_DEMO` | false |
 | `--demo-scenario` | `QSO_SIDECAR_DEMO_SCENARIO` | `normal` |
 | `--lofi-base` | `QSO_SIDECAR_LOFI_BASE` | `https://lofi.ham2k.net` |

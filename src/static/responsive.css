@@ -25,7 +25,7 @@
   .bands{grid-template-columns:repeat(3,1fr)}
   .matrix-panel{height:430px}
   .matrix-panel .table-wrap{height:332px}
-  .spots-panel{height:430px}
+  .spots-panel{height:466px}
   .spots{height:290px}
   .filters{overflow-x:auto}
   .finding-filters{grid-template-columns:repeat(3,minmax(0,1fr))}

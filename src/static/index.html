@@ -51,6 +51,10 @@
         <section class="panel spots-panel">
           <div class="panel-head"><div><p class="eyebrow">REVERSE BEACON NETWORK</p><h2>Fresh CW candidates</h2></div><span id="spot-status" class="status-dot">● —</span></div>
           <div id="participant-summary" class="participant-summary" aria-label="Participant confidence summary"></div>
+          <div class="locality-bar">
+            <div id="spot-scope" class="scope-toggle" role="group" aria-label="RBN receiver scope"><button data-scope="nearby" type="button">Nearby</button><button data-scope="all" type="button">All RBN</button></div>
+            <span id="locality-status" class="muted">All RBN receivers</span>
+          </div>
           <div id="spot-filters" class="filters" role="group" aria-label="Spot filters">
             <button data-filter="focus" class="active" aria-pressed="true">Focus</button><button data-filter="confirmed" aria-pressed="false">Confirmed</button><button data-filter="probable" aria-pressed="false">Probable</button><button data-filter="multipliers" aria-pressed="false">Mults</button><button data-filter="all" aria-pressed="false">All</button><button id="spot-hold" class="spot-hold" type="button">Hold</button>
           </div>
