@@ -1,16 +1,20 @@
 # QSO Sidecar
 
-A local, read-only contest dashboard for Ham2K PoLo. The contest-day MVP scores the
-August 2026 NAQP CW, shows the per-band multiplier matrix, accepts current PoLo ADIF
-exports, polls Ham2K Log Filer (LoFi), and can display live Reverse Beacon Network CW
-candidates. PoLo remains the authoritative logger: Sidecar has no QSO entry or edit UI.
+A local, read-only companion dashboard for [Ham2K PoLo](https://polo.ham2k.com/docs/)
+during the August 2026 NAQP CW contest. It adds claimed-score tracking, a per-band
+multiplier matrix, LoFi synchronization or ADIF import, and optional live
+[Reverse Beacon Network](https://reversebeacon.net/) candidates. PoLo remains the source
+of truth: QSO Sidecar never creates or edits contacts.
 
-Everything is served by one stable-Rust binary on loopback. HTML, CSS, and JavaScript
-are embedded in the release binary; there is no frontend toolchain or internet-loaded UI.
+A single stable Rust binary serves embedded HTML, CSS, and JavaScript on `127.0.0.1`.
+The dashboard loads no third-party frontend assets at runtime.
 
-## Fast start
+![QSO Sidecar dashboard showing synthetic NAQP CW demo data](docs/qso-sidecar-demo.jpg)
 
-Install [mise](https://mise.jdx.dev/) and then:
+## Quick start
+
+Install [mise](https://mise.jdx.dev/); it installs the stable Rust toolchain configured
+by this repository. Then run:
 
 ```bash
 mise run build
@@ -48,7 +52,7 @@ The random LoFi client key, secret, and bearer token are stored only in the OS p
 application-data directory. The directory is mode `0700` and the credential file is
 mode `0600` on Unix. They are never sent to browser JavaScript or written to logs.
 
-## Guaranteed ADIF fallback
+## ADIF fallback
 
 In PoLo, export the current operation as ADIF. Drag the `.adi`/`.adif` file onto the
 dashboard's import target, or focus it and press Enter to select a file. The parser uses
@@ -90,9 +94,16 @@ additional diagnostics; credentials and QSO payloads are not logged.
 
 ## Scoring scope
 
+QSO Sidecar currently targets the August 2026 NAQP CW contest; its dates and scoring
+rules are intentionally contest-specific rather than a general NAQP configuration.
+
 The engine implements the [2026 NAQP rules](https://ncjweb.com/NAQP-Rules.pdf): CW-only
-contacts from 18:00 UTC August 1 through 05:59:59 UTC August 2, eligible 160/80/40/20/15/10
-meter bands, one callsign per band, per-band multipliers, explicit duplicate/unresolved
-tracking, and claimed score = valid QSOs × per-band multipliers. Estimated off time uses
-the required 31-minute consecutive-QSO timestamp boundary. Adjudication penalties are
-outside this claimed-score companion.
+contacts from 18:00 UTC August 1 through 05:59:59 UTC August 2, eligible
+160/80/40/20/15/10 meter bands, one callsign per band, per-band multipliers, explicit
+duplicate/unresolved tracking, and claimed score = valid QSOs × per-band multipliers.
+Estimated off time uses the required 31-minute consecutive-QSO timestamp boundary.
+Adjudication penalties are outside this claimed-score companion.
+
+## License
+
+QSO Sidecar is available under the [MIT License](LICENSE).
