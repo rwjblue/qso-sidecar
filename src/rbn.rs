@@ -1,7 +1,5 @@
-use std::time::Duration;
-
-#[cfg(test)]
-use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, NaiveTime, TimeZone, Utc};
@@ -9,7 +7,7 @@ use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::model::Band;
 
@@ -47,8 +45,22 @@ impl ConnectionState {
     }
 }
 
+pub trait SpotSource {
+    fn parse(&self, line: &str, now: DateTime<Utc>) -> Option<RawSpot>;
+}
+
+#[derive(Debug, Default)]
+pub struct RbnSpotSource;
+
+impl SpotSource for RbnSpotSource {
+    fn parse(&self, line: &str, now: DateTime<Utc>) -> Option<RawSpot> {
+        parse_line(line, now)
+    }
+}
+
 pub async fn run(address: String, login_call: Option<String>, tx: mpsc::Sender<ClusterEvent>) {
     let mut backoff = Duration::from_secs(1);
+    let mut entropy = retry_entropy(&address);
     loop {
         let mut connected = false;
         let _ = tx
@@ -66,16 +78,42 @@ pub async fn run(address: String, login_call: Option<String>, tx: mpsc::Sender<C
         } else {
             ConnectionState::Disconnected
         };
-        let (delay, next_backoff) = retry_backoff(backoff, connected);
+        let (base_delay, next_backoff) = retry_backoff(backoff, connected);
+        let delay = jittered_delay(base_delay, entropy);
+        entropy = next_entropy(entropy);
         let _ = tx
             .send(ClusterEvent::Status {
                 state,
-                message: format!("disconnected; retrying in {}s", delay.as_secs()),
+                message: format!("disconnected; retrying in {:.1}s", delay.as_secs_f64()),
             })
             .await;
         tokio::time::sleep(delay).await;
         backoff = next_backoff;
     }
+}
+
+fn retry_entropy(address: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    address.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+fn next_entropy(value: u64) -> u64 {
+    value
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407)
+}
+
+fn jittered_delay(base: Duration, entropy: u64) -> Duration {
+    let percent = 80 + entropy % 41;
+    let millis = base.as_millis().saturating_mul(u128::from(percent)) / 100;
+    Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
 }
 
 fn retry_backoff(previous: Duration, connected: bool) -> (Duration, Duration) {
@@ -110,12 +148,26 @@ async fn connection(
     .ok();
     info!(%address, "cluster connected");
 
+    let source = RbnSpotSource;
     let mut lines = BufReader::new(read).lines();
     while let Some(line) = lines.next_line().await? {
-        if let Some(spot) = parse_line(&line, Utc::now())
-            && tx.send(ClusterEvent::Spot(spot)).await.is_err()
-        {
-            return Ok(());
+        if let Some(spot) = source.parse(&line, Utc::now()) {
+            if tx.send(ClusterEvent::Spot(spot)).await.is_err() {
+                return Ok(());
+            }
+        } else {
+            let safe_line: String = line
+                .chars()
+                .take(256)
+                .map(|character| {
+                    if character.is_control() {
+                        '\u{fffd}'
+                    } else {
+                        character
+                    }
+                })
+                .collect();
+            debug!(raw_line = %safe_line, "ignored non-CW or malformed cluster line");
         }
     }
     Ok(())
@@ -141,7 +193,7 @@ pub fn parse_line(line: &str, now: DateTime<Utc>) -> Option<RawSpot> {
     let speed_wpm = tokens
         .windows(2)
         .find(|pair| pair[1].eq_ignore_ascii_case("WPM"))
-        .and_then(|pair| pair[0].parse().ok());
+        .and_then(|pair| pair[0].parse().ok())?;
     let time = tokens
         .iter()
         .find_map(|token| parse_hhmm(token, now))
@@ -154,7 +206,7 @@ pub fn parse_line(line: &str, now: DateTime<Utc>) -> Option<RawSpot> {
         time,
         spotter,
         snr_db,
-        speed_wpm,
+        speed_wpm: Some(speed_wpm),
     })
 }
 
@@ -192,27 +244,6 @@ fn is_plausible_call(call: &str) -> bool {
         && call.chars().any(|value| value.is_ascii_digit())
 }
 
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub struct Deduplicator {
-    seen: HashMap<(String, Band), DateTime<Utc>>,
-}
-
-#[cfg(test)]
-impl Deduplicator {
-    pub fn accept(&mut self, spot: &RawSpot, window: chrono::Duration) -> bool {
-        self.seen
-            .retain(|_, time| spot.time.signed_duration_since(*time) <= window * 3);
-        let key = (spot.call.clone(), spot.band);
-        let duplicate = self
-            .seen
-            .get(&key)
-            .is_some_and(|time| spot.time.signed_duration_since(*time).abs() <= window);
-        self.seen.insert(key, spot.time);
-        !duplicate
-    }
-}
-
 use chrono::Timelike;
 
 #[cfg(test)]
@@ -246,13 +277,10 @@ mod tests {
     }
 
     #[test]
-    fn deduplicates_call_on_band_inside_window() {
-        let first = parse_line("DX de WZ7I-#: 14025.1 K1ABC 17 dB 26 WPM 1823Z", now()).unwrap();
-        let mut second = first.clone();
-        second.time += chrono::Duration::seconds(30);
-        let mut dedupe = Deduplicator::default();
-        assert!(dedupe.accept(&first, chrono::Duration::seconds(90)));
-        assert!(!dedupe.accept(&second, chrono::Duration::seconds(90)));
+    fn rejects_non_cw_and_malformed_lines() {
+        assert!(parse_line("DX de WZ7I-#: 14025.1 K1ABC 17 dB RTTY 1823Z", now()).is_none());
+        assert!(parse_line("cluster login:", now()).is_none());
+        assert!(parse_line("DX de WZ7I-#: nope K1ABC 17 dB 26 WPM 1823Z", now()).is_none());
     }
 
     #[test]
@@ -273,5 +301,16 @@ mod tests {
             retry_backoff(Duration::from_secs(60), false),
             (Duration::from_secs(60), Duration::from_secs(60))
         );
+    }
+
+    #[test]
+    fn reconnect_jitter_is_deterministic_and_bounded() {
+        let base = Duration::from_secs(10);
+        assert_eq!(jittered_delay(base, 7), jittered_delay(base, 7));
+        for entropy in 0..100 {
+            let delay = jittered_delay(base, entropy);
+            assert!(delay >= Duration::from_secs(8));
+            assert!(delay <= Duration::from_secs(12));
+        }
     }
 }

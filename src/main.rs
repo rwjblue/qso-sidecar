@@ -6,7 +6,7 @@ mod naqp;
 mod rbn;
 mod storage;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,6 +52,18 @@ struct Args {
     /// Disable the live cluster connection (and remain Single Operator eligible).
     #[arg(long, env = "QSO_SIDECAR_NO_RBN")]
     no_rbn: bool,
+    /// Minutes before an RBN candidate expires.
+    #[arg(long, default_value_t = 10, env = "QSO_SIDECAR_SPOT_TTL_MINUTES")]
+    spot_ttl_minutes: u64,
+    /// Seconds in which nearby reports for the same call and band are aggregated.
+    #[arg(long, default_value_t = 90, env = "QSO_SIDECAR_SPOT_DEDUPE_SECONDS")]
+    spot_dedupe_seconds: u64,
+    /// Maximum frequency separation for aggregating reports, in kHz.
+    #[arg(long, default_value_t = 1.0, env = "QSO_SIDECAR_SPOT_DEDUPE_KHZ")]
+    spot_dedupe_khz: f64,
+    /// Maximum number of RBN candidates retained in memory.
+    #[arg(long, default_value_t = 200, env = "QSO_SIDECAR_SPOT_CAPACITY")]
+    spot_capacity: usize,
     /// Override the LoFi API base for development.
     #[arg(
         long,
@@ -59,6 +71,52 @@ struct Args {
         env = "QSO_SIDECAR_LOFI_BASE"
     )]
     lofi_base: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SpotPolicy {
+    ttl: chrono::Duration,
+    dedupe_window: chrono::Duration,
+    dedupe_khz: f64,
+    capacity: usize,
+}
+
+impl Default for SpotPolicy {
+    fn default() -> Self {
+        Self {
+            ttl: chrono::Duration::minutes(10),
+            dedupe_window: chrono::Duration::seconds(90),
+            dedupe_khz: 1.0,
+            capacity: 200,
+        }
+    }
+}
+
+impl Args {
+    fn spot_policy(&self) -> Result<SpotPolicy> {
+        ensure!(
+            self.spot_ttl_minutes > 0,
+            "spot TTL must be greater than zero"
+        );
+        ensure!(
+            self.spot_dedupe_seconds > 0,
+            "spot dedupe window must be greater than zero"
+        );
+        ensure!(
+            self.spot_dedupe_khz.is_finite() && self.spot_dedupe_khz > 0.0,
+            "spot dedupe frequency must be a positive finite number"
+        );
+        ensure!(
+            self.spot_capacity > 0,
+            "spot capacity must be greater than zero"
+        );
+        Ok(SpotPolicy {
+            ttl: chrono::Duration::minutes(i64::try_from(self.spot_ttl_minutes)?),
+            dedupe_window: chrono::Duration::seconds(i64::try_from(self.spot_dedupe_seconds)?),
+            dedupe_khz: self.spot_dedupe_khz,
+            capacity: self.spot_capacity,
+        })
+    }
 }
 
 fn validate_rbn_config(no_rbn: bool, call: Option<&str>) -> Result<()> {
@@ -91,6 +149,7 @@ struct Runtime {
     import_diagnostics: adif::ImportDiagnostics,
     spot_status: String,
     spots_enabled: bool,
+    spot_policy: SpotPolicy,
     demo: bool,
 }
 
@@ -126,7 +185,11 @@ struct Contest {
 }
 
 impl Runtime {
-    fn normal(spots_enabled: bool, restored: Option<storage::PersistedState>) -> Self {
+    fn normal(
+        spots_enabled: bool,
+        spot_policy: SpotPolicy,
+        restored: Option<storage::PersistedState>,
+    ) -> Self {
         let spot_status = if spots_enabled {
             "starting".into()
         } else {
@@ -146,6 +209,7 @@ impl Runtime {
                 import_diagnostics: restored.import_diagnostics,
                 spot_status,
                 spots_enabled,
+                spot_policy,
                 demo: false,
             };
         }
@@ -162,6 +226,7 @@ impl Runtime {
             import_diagnostics: adif::ImportDiagnostics::default(),
             spot_status,
             spots_enabled,
+            spot_policy,
             demo: false,
         }
     }
@@ -185,13 +250,7 @@ impl Runtime {
 
     fn public(&self) -> PublicState {
         let score = naqp::score(self.qsos.values().cloned());
-        let mut spots: Vec<_> = self
-            .spots
-            .iter()
-            .filter(|spot| Utc::now() - spot.time <= chrono::Duration::minutes(10))
-            .cloned()
-            .collect();
-        spots.sort_by_key(|spot| std::cmp::Reverse(spot.time));
+        let spots = self.fresh_spots(Utc::now());
         let current_band = self
             .qsos
             .values()
@@ -227,6 +286,17 @@ impl Runtime {
             current_band,
         }
     }
+
+    fn fresh_spots(&self, now: DateTime<Utc>) -> Vec<Spot> {
+        let mut spots: Vec<_> = self
+            .spots
+            .iter()
+            .filter(|spot| now - spot.time <= self.spot_policy.ttl)
+            .cloned()
+            .collect();
+        spots.sort_by_key(|spot| std::cmp::Reverse(spot.time));
+        spots
+    }
 }
 
 #[tokio::main]
@@ -239,6 +309,7 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     validate_rbn_config(args.no_rbn, args.call.as_deref())?;
+    let spot_policy = args.spot_policy()?;
     let lofi = lofi::LofiClient::new(args.lofi_base)?;
     let store = storage::StateStore::for_app()?;
     let restored = match store.load() {
@@ -250,9 +321,9 @@ async fn main() -> Result<()> {
     };
     let (updates, _) = broadcast::channel(32);
     let runtime = if args.demo {
-        demo_runtime(!args.no_rbn)
+        demo_runtime(!args.no_rbn, spot_policy)
     } else {
-        Runtime::normal(!args.no_rbn, restored)
+        Runtime::normal(!args.no_rbn, spot_policy, restored)
     };
     let state = AppState {
         runtime: Arc::new(RwLock::new(runtime)),
@@ -443,7 +514,7 @@ async fn toggle_demo(State(state): State<AppState>, Json(request): Json<DemoRequ
     let spots_enabled = state.runtime.read().await.spots_enabled;
     let mut runtime = state.runtime.write().await;
     if request.enabled {
-        *runtime = demo_runtime(spots_enabled);
+        *runtime = demo_runtime(spots_enabled, runtime.spot_policy);
     } else {
         let restored = match state.store.load() {
             Ok(restored) => restored,
@@ -454,7 +525,7 @@ async fn toggle_demo(State(state): State<AppState>, Json(request): Json<DemoRequ
                 );
             }
         };
-        *runtime = Runtime::normal(spots_enabled, restored);
+        *runtime = Runtime::normal(spots_enabled, runtime.spot_policy, restored);
     }
     drop(runtime);
     state.updates.send(()).ok();
@@ -606,17 +677,25 @@ fn update_cluster_status(runtime: &mut Runtime, state: rbn::ConnectionState, mes
 fn merge_spot(runtime: &mut Runtime, raw: rbn::RawSpot) {
     runtime
         .spots
-        .retain(|spot| raw.time - spot.time <= chrono::Duration::minutes(10));
+        .retain(|spot| raw.time - spot.time <= runtime.spot_policy.ttl);
     if let Some(existing) = runtime.spots.iter_mut().find(|spot| {
         spot.call == raw.call
             && spot.band == raw.band
-            && (spot.time - raw.time).abs() <= chrono::Duration::seconds(90)
+            && (spot.time - raw.time).abs() <= runtime.spot_policy.dedupe_window
+            && (spot.frequency_khz - raw.frequency_khz).abs() <= runtime.spot_policy.dedupe_khz
     }) {
-        existing.time = raw.time;
-        existing.frequency_khz = raw.frequency_khz;
-        existing.spotter = raw.spotter;
-        existing.snr_db = raw.snr_db.or(existing.snr_db);
-        existing.speed_wpm = raw.speed_wpm.or(existing.speed_wpm);
+        existing.spotters.insert(raw.spotter.clone());
+        existing.best_snr_db = match (existing.best_snr_db, raw.snr_db) {
+            (Some(old), Some(new)) => Some(old.max(new)),
+            (old, new) => old.or(new),
+        };
+        if raw.time >= existing.time {
+            existing.time = raw.time;
+            existing.frequency_khz = raw.frequency_khz;
+            existing.spotter = raw.spotter;
+            existing.snr_db = raw.snr_db.or(existing.snr_db);
+            existing.speed_wpm = raw.speed_wpm.or(existing.speed_wpm);
+        }
         existing.reports += 1;
         existing.stale = false;
         return;
@@ -633,15 +712,17 @@ fn merge_spot(runtime: &mut Runtime, raw: rbn::RawSpot) {
         frequency_khz: raw.frequency_khz,
         band: raw.band,
         time: raw.time,
-        spotter: raw.spotter,
+        spotter: raw.spotter.clone(),
+        spotters: BTreeSet::from([raw.spotter]),
         snr_db: raw.snr_db,
+        best_snr_db: raw.snr_db,
         speed_wpm: raw.speed_wpm,
         class,
         predicted_multiplier,
         reports: 1,
         stale: false,
     });
-    runtime.spots.truncate(200);
+    runtime.spots.truncate(runtime.spot_policy.capacity);
 }
 
 fn classify_spot(runtime: &Runtime, call: &str, band: Band) -> (SpotClass, Option<String>) {
@@ -679,7 +760,7 @@ fn classify_spot(runtime: &Runtime, call: &str, band: Band) -> (SpotClass, Optio
     (SpotClass::Unknown, None)
 }
 
-fn demo_runtime(spots_enabled: bool) -> Runtime {
+fn demo_runtime(spots_enabled: bool, spot_policy: SpotPolicy) -> Runtime {
     let mut qsos = BTreeMap::new();
     let demo = [
         ("W1AW", Band::B20, 18, 3, "AL", "CT"),
@@ -773,6 +854,7 @@ fn demo_runtime(spots_enabled: bool) -> Runtime {
             "disabled — Single Operator safe".into()
         },
         spots_enabled,
+        spot_policy,
         demo: true,
     }
 }
@@ -793,7 +875,9 @@ fn demo_spot(
         band,
         time,
         spotter: "WZ7I-#".into(),
+        spotters: BTreeSet::from(["WZ7I-#".into()]),
         snr_db: Some(16),
+        best_snr_db: Some(16),
         speed_wpm: Some(28),
         class,
         predicted_multiplier: multiplier.map(str::to_string),
@@ -830,6 +914,24 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
+    fn raw_spot(
+        call: &str,
+        frequency_khz: f64,
+        time: DateTime<Utc>,
+        spotter: &str,
+        snr_db: i16,
+    ) -> rbn::RawSpot {
+        rbn::RawSpot {
+            call: call.into(),
+            frequency_khz,
+            band: Band::B20,
+            time,
+            spotter: spotter.into(),
+            snr_db: Some(snr_db),
+            speed_wpm: Some(28),
+        }
+    }
+
     #[test]
     fn rbn_requires_a_login_callsign() {
         let error = validate_rbn_config(false, None).unwrap_err();
@@ -844,8 +946,18 @@ mod tests {
     }
 
     #[test]
+    fn spot_policy_rejects_unbounded_or_invalid_values() {
+        let args =
+            Args::try_parse_from(["qso-sidecar", "--no-rbn", "--spot-capacity", "0"]).unwrap();
+        assert!(args.spot_policy().is_err());
+        let args =
+            Args::try_parse_from(["qso-sidecar", "--no-rbn", "--spot-dedupe-khz", "NaN"]).unwrap();
+        assert!(args.spot_policy().is_err());
+    }
+
+    #[test]
     fn normal_runtime_restores_last_good_log_state() {
-        let demo = demo_runtime(false);
+        let demo = demo_runtime(false, SpotPolicy::default());
         let persisted = storage::PersistedState::new(
             demo.qsos.clone(),
             Some("restored-operation".into()),
@@ -855,7 +967,7 @@ mod tests {
             adif::ImportDiagnostics::default(),
         );
 
-        let runtime = Runtime::normal(false, Some(persisted));
+        let runtime = Runtime::normal(false, SpotPolicy::default(), Some(persisted));
 
         assert_eq!(runtime.qsos.len(), demo.qsos.len());
         assert_eq!(
@@ -868,7 +980,7 @@ mod tests {
 
     #[test]
     fn disconnect_marks_existing_candidates_stale() {
-        let mut runtime = demo_runtime(true);
+        let mut runtime = demo_runtime(true, SpotPolicy::default());
 
         update_cluster_status(
             &mut runtime,
@@ -881,7 +993,7 @@ mod tests {
 
     #[test]
     fn refreshed_candidate_is_no_longer_stale() {
-        let mut runtime = demo_runtime(true);
+        let mut runtime = demo_runtime(true, SpotPolicy::default());
         update_cluster_status(
             &mut runtime,
             rbn::ConnectionState::Disconnected,
@@ -914,6 +1026,114 @@ mod tests {
                 .iter()
                 .filter(|spot| spot.id != refreshed.id)
                 .all(|spot| spot.stale)
+        );
+    }
+
+    #[test]
+    fn reports_aggregate_distinct_skimmers_and_best_snr() {
+        let mut runtime = Runtime::normal(false, SpotPolicy::default(), None);
+        let now = Utc::now();
+        merge_spot(&mut runtime, raw_spot("K1ABC", 14_025.1, now, "WZ7I-#", 20));
+        merge_spot(
+            &mut runtime,
+            raw_spot(
+                "K1ABC",
+                14_025.3,
+                now + chrono::Duration::seconds(20),
+                "K3LR-#",
+                8,
+            ),
+        );
+        merge_spot(
+            &mut runtime,
+            raw_spot(
+                "K1ABC",
+                14_025.2,
+                now + chrono::Duration::seconds(30),
+                "K3LR-#",
+                12,
+            ),
+        );
+
+        let spot = runtime.spots.front().unwrap();
+        assert_eq!(runtime.spots.len(), 1);
+        assert_eq!(spot.reports, 3);
+        assert_eq!(spot.spotters.len(), 2);
+        assert_eq!(spot.spotter, "K3LR-#");
+        assert_eq!(spot.snr_db, Some(12));
+        assert_eq!(spot.best_snr_db, Some(20));
+    }
+
+    #[test]
+    fn dedupe_respects_frequency_and_time_windows() {
+        let mut runtime = Runtime::normal(false, SpotPolicy::default(), None);
+        let now = Utc::now();
+        merge_spot(&mut runtime, raw_spot("K1ABC", 14_025.0, now, "WZ7I-#", 10));
+        merge_spot(
+            &mut runtime,
+            raw_spot(
+                "K1ABC",
+                14_027.0,
+                now + chrono::Duration::seconds(20),
+                "K3LR-#",
+                11,
+            ),
+        );
+        merge_spot(
+            &mut runtime,
+            raw_spot(
+                "K1ABC",
+                14_025.1,
+                now + chrono::Duration::seconds(91),
+                "W1AW-#",
+                12,
+            ),
+        );
+
+        assert_eq!(runtime.spots.len(), 3);
+    }
+
+    #[test]
+    fn candidate_expiry_and_capacity_are_bounded() {
+        let policy = SpotPolicy {
+            ttl: chrono::Duration::minutes(1),
+            capacity: 25,
+            ..SpotPolicy::default()
+        };
+        let mut runtime = Runtime::normal(false, policy, None);
+        let now = Utc::now();
+        for index in 0..10_000 {
+            merge_spot(
+                &mut runtime,
+                raw_spot(
+                    &format!("K{index}A"),
+                    14_000.0 + f64::from(index % 300),
+                    now,
+                    "WZ7I-#",
+                    10,
+                ),
+            );
+        }
+
+        assert_eq!(runtime.spots.len(), 25);
+        assert!(
+            runtime
+                .fresh_spots(now + chrono::Duration::seconds(61))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn classifies_same_band_worked_and_cross_band_verified_multiplier() {
+        let runtime = demo_runtime(true, SpotPolicy::default());
+
+        assert_eq!(
+            classify_spot(&runtime, "W1AW", Band::B20),
+            (SpotClass::Worked, None)
+        );
+        assert_eq!(
+            classify_spot(&runtime, "N6RO", Band::B20),
+            (SpotClass::VerifiedMultiplier, Some("CA".into()))
         );
     }
 }

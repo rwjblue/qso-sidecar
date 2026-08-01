@@ -81,6 +81,8 @@ warning whenever spots are enabled.
 
 Spots never award QSO or multiplier credit. An exchange copied from a worked QSO on
 another band is labeled **verified needed**; inference is explicitly labeled possible.
+See [`docs/rbn-pipeline.md`](docs/rbn-pipeline.md) for aggregation, expiry, and the
+call-history inference policy.
 
 ## Configuration
 
@@ -92,6 +94,10 @@ CLI flags also have environment-variable equivalents:
 | `--cluster` | `QSO_SIDECAR_CLUSTER` | `telnet.reversebeacon.net:7000` |
 | `--call` | `QSO_SIDECAR_CALL` | required unless `--no-rbn` |
 | `--no-rbn` | `QSO_SIDECAR_NO_RBN` | false |
+| `--spot-ttl-minutes` | `QSO_SIDECAR_SPOT_TTL_MINUTES` | `10` |
+| `--spot-dedupe-seconds` | `QSO_SIDECAR_SPOT_DEDUPE_SECONDS` | `90` |
+| `--spot-dedupe-khz` | `QSO_SIDECAR_SPOT_DEDUPE_KHZ` | `1.0` |
+| `--spot-capacity` | `QSO_SIDECAR_SPOT_CAPACITY` | `200` |
 | `--demo` | `QSO_SIDECAR_DEMO` | false |
 | `--lofi-base` | `QSO_SIDECAR_LOFI_BASE` | `https://lofi.ham2k.net` |
 
