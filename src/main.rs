@@ -1,8 +1,10 @@
 mod adif;
 mod lofi;
+mod log_source;
 mod model;
 mod naqp;
 mod rbn;
+mod storage;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -72,6 +74,7 @@ struct AppState {
     runtime: Arc<RwLock<Runtime>>,
     updates: broadcast::Sender<()>,
     lofi: lofi::LofiClient,
+    store: storage::StateStore,
 }
 
 #[derive(Debug)]
@@ -81,6 +84,7 @@ struct Runtime {
     operations: Vec<Operation>,
     selected_operation: Option<String>,
     source: String,
+    source_kind: Option<log_source::LogSourceKind>,
     source_freshness: Option<DateTime<Utc>>,
     lofi_status: String,
     lofi_account_call: Option<String>,
@@ -100,6 +104,7 @@ struct PublicState {
     operations: Vec<Operation>,
     selected_operation: Option<String>,
     source: String,
+    source_kind: Option<log_source::LogSourceKind>,
     source_freshness: Option<DateTime<Utc>>,
     lofi_status: String,
     lofi_linked: bool,
@@ -121,6 +126,63 @@ struct Contest {
 }
 
 impl Runtime {
+    fn normal(spots_enabled: bool, restored: Option<storage::PersistedState>) -> Self {
+        let spot_status = if spots_enabled {
+            "starting".into()
+        } else {
+            "disabled — Single Operator safe".into()
+        };
+        if let Some(restored) = restored {
+            return Self {
+                qsos: restored.qsos,
+                spots: VecDeque::new(),
+                operations: Vec::new(),
+                selected_operation: restored.selected_operation,
+                source: format!("Restored last-good: {}", restored.source),
+                source_kind: restored.source_kind,
+                source_freshness: restored.source_freshness,
+                lofi_status: "starting LoFi client registration".into(),
+                lofi_account_call: None,
+                import_diagnostics: restored.import_diagnostics,
+                spot_status,
+                spots_enabled,
+                demo: false,
+            };
+        }
+        Self {
+            qsos: BTreeMap::new(),
+            spots: VecDeque::new(),
+            operations: Vec::new(),
+            selected_operation: None,
+            source: "Waiting for PoLo data".into(),
+            source_kind: None,
+            source_freshness: None,
+            lofi_status: "starting LoFi client registration".into(),
+            lofi_account_call: None,
+            import_diagnostics: adif::ImportDiagnostics::default(),
+            spot_status,
+            spots_enabled,
+            demo: false,
+        }
+    }
+
+    fn persisted(
+        &self,
+        qsos: BTreeMap<String, Qso>,
+        source_kind: log_source::LogSourceKind,
+        source: String,
+        source_freshness: DateTime<Utc>,
+    ) -> storage::PersistedState {
+        storage::PersistedState::new(
+            qsos,
+            self.selected_operation.clone(),
+            Some(source_kind),
+            source,
+            Some(source_freshness),
+            self.import_diagnostics.clone(),
+        )
+    }
+
     fn public(&self) -> PublicState {
         let score = naqp::score(self.qsos.values().cloned());
         let mut spots: Vec<_> = self
@@ -150,6 +212,7 @@ impl Runtime {
             operations: self.operations.clone(),
             selected_operation: self.selected_operation.clone(),
             source: self.source.clone(),
+            source_kind: self.source_kind,
             source_freshness: self.source_freshness,
             lofi_status: self.lofi_status.clone(),
             lofi_linked: self.lofi_account_call.is_some(),
@@ -177,33 +240,25 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     validate_rbn_config(args.no_rbn, args.call.as_deref())?;
     let lofi = lofi::LofiClient::new(args.lofi_base)?;
+    let store = storage::StateStore::for_app()?;
+    let restored = match store.load() {
+        Ok(state) => state,
+        Err(error) => {
+            warn!(%error, "could not restore last-good log state");
+            None
+        }
+    };
     let (updates, _) = broadcast::channel(32);
     let runtime = if args.demo {
         demo_runtime(!args.no_rbn)
     } else {
-        Runtime {
-            qsos: BTreeMap::new(),
-            spots: VecDeque::new(),
-            operations: Vec::new(),
-            selected_operation: None,
-            source: "Waiting for PoLo data".into(),
-            source_freshness: None,
-            lofi_status: "starting LoFi client registration".into(),
-            lofi_account_call: None,
-            import_diagnostics: adif::ImportDiagnostics::default(),
-            spot_status: if args.no_rbn {
-                "disabled — Single Operator safe".into()
-            } else {
-                "starting".into()
-            },
-            spots_enabled: !args.no_rbn,
-            demo: false,
-        }
+        Runtime::normal(!args.no_rbn, restored)
     };
     let state = AppState {
         runtime: Arc::new(RwLock::new(runtime)),
         updates,
         lofi,
+        store,
     };
 
     tokio::spawn(run_lofi_sync(state.clone()));
@@ -288,15 +343,39 @@ async fn import_adif(State(state): State<AppState>, mut multipart: Multipart) ->
         return api_error(StatusCode::BAD_REQUEST, "missing ADIF file".into());
     };
     let mut runtime = state.runtime.write().await;
-    if runtime.demo {
-        runtime.qsos.clear();
-        runtime.spots.clear();
-    }
-    match adif::import_snapshot(&bytes, &mut runtime.qsos) {
+    let was_demo = runtime.demo;
+    let mut next_qsos = if runtime.demo {
+        BTreeMap::new()
+    } else {
+        runtime.qsos.clone()
+    };
+    match adif::import_snapshot(&bytes, &mut next_qsos) {
         Ok(diagnostics) => {
+            let source = "PoLo ADIF snapshot".to_string();
+            let freshness = Utc::now();
+            let persisted = storage::PersistedState::new(
+                next_qsos.clone(),
+                None,
+                Some(log_source::LogSourceKind::Adif),
+                source.clone(),
+                Some(freshness),
+                diagnostics.clone(),
+            );
+            if let Err(error) = state.store.save(&persisted) {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("could not preserve imported log: {error:#}"),
+                );
+            }
+            runtime.qsos = next_qsos;
+            if was_demo {
+                runtime.spots.clear();
+            }
+            runtime.selected_operation = None;
             runtime.import_diagnostics = diagnostics.clone();
-            runtime.source = "PoLo ADIF snapshot".into();
-            runtime.source_freshness = Some(Utc::now());
+            runtime.source = source;
+            runtime.source_kind = Some(log_source::LogSourceKind::Adif);
+            runtime.source_freshness = Some(freshness);
             runtime.demo = false;
             drop(runtime);
             state.updates.send(()).ok();
@@ -349,9 +428,7 @@ async fn select_operation(
         return api_error(StatusCode::NOT_FOUND, "operation not found".into());
     }
     runtime.selected_operation = Some(request.operation_id);
-    runtime.qsos.clear();
-    runtime.source = "LoFi operation selected; synchronizing".into();
-    runtime.source_freshness = None;
+    runtime.source = "Last-good data retained; synchronizing selected LoFi operation".into();
     drop(runtime);
     state.updates.send(()).ok();
     Json(json!({"ok": true})).into_response()
@@ -368,11 +445,16 @@ async fn toggle_demo(State(state): State<AppState>, Json(request): Json<DemoRequ
     if request.enabled {
         *runtime = demo_runtime(spots_enabled);
     } else {
-        runtime.qsos.clear();
-        runtime.spots.clear();
-        runtime.source = "Waiting for LoFi sync or ADIF import".into();
-        runtime.source_freshness = None;
-        runtime.demo = false;
+        let restored = match state.store.load() {
+            Ok(restored) => restored,
+            Err(error) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("could not restore last-good log: {error:#}"),
+                );
+            }
+        };
+        *runtime = Runtime::normal(spots_enabled, restored);
     }
     drop(runtime);
     state.updates.send(()).ok();
@@ -439,26 +521,31 @@ async fn run_lofi_sync(state: AppState) {
                 state.updates.send(()).ok();
                 return Ok(());
             };
-            if selected_seen.as_deref() != Some(&selected) {
-                watermark = None;
-                selected_seen = Some(selected.clone());
-            }
-            let qsos = state.lofi.qsos(&selected, watermark).await?;
-            if let Some(next) = qsos
+            let selection_changed = selected_seen.as_deref() != Some(&selected);
+            let query_watermark = if selection_changed { None } else { watermark };
+            let qsos = state.lofi.qsos(&selected, query_watermark).await?;
+            let next_watermark = qsos
                 .iter()
                 .filter_map(|qso| qso.raw.get("updatedAtMillis").and_then(Value::as_i64))
                 .max()
-            {
-                watermark = Some(watermark.map_or(next, |old| old.max(next)));
-            }
+                .map(|next| query_watermark.map_or(next, |old| old.max(next)));
             let mut runtime = state.runtime.write().await;
             if !runtime.demo {
-                for qso in qsos {
-                    runtime.qsos.insert(qso.id.clone(), qso);
-                }
-                runtime.source = "Live Ham2K LoFi sync".into();
-                runtime.source_freshness = Some(Utc::now());
+                let mut next_qsos = runtime.qsos.clone();
+                let applied =
+                    log_source::LogUpdate::lofi(qsos, selection_changed).apply(&mut next_qsos);
+                let source = "Live Ham2K LoFi sync".to_string();
+                let freshness = Utc::now();
+                let persisted =
+                    runtime.persisted(next_qsos.clone(), applied.source, source.clone(), freshness);
+                state.store.save(&persisted)?;
+                runtime.qsos = next_qsos;
+                runtime.source = source;
+                runtime.source_kind = Some(applied.source);
+                runtime.source_freshness = Some(freshness);
             }
+            selected_seen = Some(selected);
+            watermark = next_watermark.or(query_watermark);
             drop(runtime);
             state.updates.send(()).ok();
             Ok(())
@@ -675,6 +762,7 @@ fn demo_runtime(spots_enabled: bool) -> Runtime {
         }],
         selected_operation: Some("demo-naqp".into()),
         source: "Synthetic demo data — no private log loaded".into(),
+        source_kind: None,
         source_freshness: Some(now),
         lofi_status: "demo mode; LoFi can still be linked below".into(),
         lofi_account_call: None,
@@ -753,6 +841,29 @@ mod tests {
     #[test]
     fn disabled_rbn_does_not_require_a_login_callsign() {
         assert!(validate_rbn_config(true, None).is_ok());
+    }
+
+    #[test]
+    fn normal_runtime_restores_last_good_log_state() {
+        let demo = demo_runtime(false);
+        let persisted = storage::PersistedState::new(
+            demo.qsos.clone(),
+            Some("restored-operation".into()),
+            Some(log_source::LogSourceKind::Lofi),
+            "Live Ham2K LoFi sync".into(),
+            demo.source_freshness,
+            adif::ImportDiagnostics::default(),
+        );
+
+        let runtime = Runtime::normal(false, Some(persisted));
+
+        assert_eq!(runtime.qsos.len(), demo.qsos.len());
+        assert_eq!(
+            runtime.selected_operation.as_deref(),
+            Some("restored-operation")
+        );
+        assert_eq!(runtime.source_kind, Some(log_source::LogSourceKind::Lofi));
+        assert!(runtime.source.starts_with("Restored last-good:"));
     }
 
     #[test]

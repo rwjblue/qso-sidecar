@@ -3,13 +3,14 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::log_source::LogUpdate;
 use crate::model::{Band, Qso};
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImportDiagnostics {
     pub records_seen: usize,
     pub added: usize,
@@ -29,19 +30,10 @@ pub fn import_snapshot(
         ..ImportDiagnostics::default()
     };
 
+    let mut qsos = Vec::new();
     for (index, record) in records.into_iter().enumerate() {
         match record_to_qso(record) {
-            Ok(qso) => match existing.get(&qso.id) {
-                None => {
-                    existing.insert(qso.id.clone(), qso);
-                    diagnostics.added += 1;
-                }
-                Some(old) if materially_equal(old, &qso) => diagnostics.unchanged += 1,
-                Some(_) => {
-                    existing.insert(qso.id.clone(), qso);
-                    diagnostics.updated += 1;
-                }
-            },
+            Ok(qso) => qsos.push(qso),
             Err(error) => {
                 diagnostics.skipped += 1;
                 if diagnostics.warnings.len() < 20 {
@@ -52,6 +44,10 @@ pub fn import_snapshot(
             }
         }
     }
+    let summary = LogUpdate::adif(qsos).apply(existing);
+    diagnostics.added = summary.added;
+    diagnostics.updated = summary.updated;
+    diagnostics.unchanged = summary.unchanged;
     Ok(diagnostics)
 }
 
@@ -192,10 +188,6 @@ fn string_field(raw: &Value, key: &str) -> Option<String> {
     raw.get(key)?.as_str().map(str::to_string)
 }
 
-fn materially_equal(left: &Qso, right: &Qso) -> bool {
-    serde_json::to_value(left).ok() == serde_json::to_value(right).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +229,16 @@ mod tests {
         assert_eq!(diagnostics.unchanged, 1);
         assert_eq!(diagnostics.added, 1);
         assert_eq!(qsos.len(), 2);
+    }
+
+    #[test]
+    fn malformed_snapshot_does_not_change_last_good_records() {
+        let mut qsos = BTreeMap::new();
+        import_snapshot(EXPORT.as_bytes(), &mut qsos).unwrap();
+        let before = serde_json::to_value(&qsos).unwrap();
+
+        assert!(import_snapshot(b"<CALL:50>short", &mut qsos).is_err());
+
+        assert_eq!(serde_json::to_value(&qsos).unwrap(), before);
     }
 }

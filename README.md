@@ -52,6 +52,11 @@ The random LoFi client key, secret, and bearer token are stored only in the OS p
 application-data directory. The directory is mode `0700` and the credential file is
 mode `0600` on Unix. They are never sent to browser JavaScript or written to logs.
 
+Sidecar also atomically stores the last successful normalized log snapshot in that
+directory and restores it on restart before synchronizing. See
+[`docs/polo-integration.md`](docs/polo-integration.md) for source, recovery, and
+privacy details.
+
 ## ADIF fallback
 
 In PoLo, export the current operation as ADIF. Drag the `.adi`/`.adif` file onto the
