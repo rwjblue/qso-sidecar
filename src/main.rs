@@ -10,11 +10,12 @@ mod storage;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
 use axum::extract::{DefaultBodyLimit, Multipart, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -24,15 +25,14 @@ use clap::{Parser, ValueEnum};
 use futures_util::Stream;
 use model::{
     Band, EvidenceSource, LocationConclusion, LocationConfidence, LocationEvidence, Operation,
-    ParticipationConclusion, ParticipationConfidence, ParticipationEvidence, Qso, Spot, SpotClass,
-    StationEvidence,
+    ParticipationConclusion, ParticipationConfidence, ParticipationEvidence, Qso, SourceId,
+    SourcePolicy, SourceStatus, Spot, SpotClass, StationEvidence,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
-use tower_http::trace::TraceLayer;
 use tracing::{error, info, info_span, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -160,6 +160,28 @@ fn http_trace_path(uri: &Uri) -> &str {
     uri.path()
 }
 
+fn quiet_http_response(path: &str, status: StatusCode) -> bool {
+    path == "/api/state" && status.is_success()
+}
+
+async fn trace_http_request(request: axum::extract::Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = http_trace_path(request.uri()).to_owned();
+    let span = info_span!("http.request", %method, %path);
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let status = response.status();
+    let latency_ms = started.elapsed().as_millis();
+
+    if quiet_http_response(&path, status) {
+        tracing::debug!(parent: &span, status = status.as_u16(), latency_ms, "HTTP response");
+    } else {
+        info!(parent: &span, status = status.as_u16(), latency_ms, "HTTP response");
+    }
+
+    response
+}
+
 #[derive(Clone)]
 struct AppState {
     runtime: Arc<RwLock<Runtime>>,
@@ -183,7 +205,7 @@ struct Runtime {
     import_diagnostics: adif::ImportDiagnostics,
     source_diagnostics: Vec<model::RecordDiagnostic>,
     spot_status: String,
-    spots_enabled: bool,
+    source_policy: SourcePolicy,
     spot_policy: SpotPolicy,
     demo: bool,
 }
@@ -208,7 +230,8 @@ struct PublicState {
     source_diagnostics: Vec<model::RecordDiagnostic>,
     spot_status: String,
     spots_enabled: bool,
-    assisted_warning: Option<&'static str>,
+    assisted_warning: Option<String>,
+    source_capabilities: Vec<SourceStatus>,
     demo: bool,
     current_band: Option<Band>,
     station_intelligence: Vec<StationIntelligence>,
@@ -251,6 +274,8 @@ impl Runtime {
         spot_policy: SpotPolicy,
         restored: Option<storage::PersistedState>,
     ) -> Self {
+        let mut source_policy = SourcePolicy::default();
+        source_policy.set_enabled(SourceId::ReverseBeaconNetwork, spots_enabled);
         let spot_status = if spots_enabled {
             "starting".into()
         } else {
@@ -270,7 +295,7 @@ impl Runtime {
                 import_diagnostics: restored.import_diagnostics,
                 source_diagnostics: restored.source_diagnostics,
                 spot_status,
-                spots_enabled,
+                source_policy,
                 spot_policy,
                 demo: false,
             };
@@ -288,7 +313,7 @@ impl Runtime {
             import_diagnostics: adif::ImportDiagnostics::default(),
             source_diagnostics: Vec::new(),
             spot_status,
-            spots_enabled,
+            source_policy,
             spot_policy,
             demo: false,
         }
@@ -324,6 +349,16 @@ impl Runtime {
             .filter(|qso| !qso.deleted)
             .max_by_key(|qso| qso.timestamp)
             .and_then(|qso| qso.band);
+        let mut source_policy = self.source_policy.clone();
+        source_policy.set_enabled(
+            SourceId::PoloLofi,
+            self.source_kind == Some(log_source::LogSourceKind::Lofi),
+        );
+        source_policy.set_enabled(
+            SourceId::AdifImport,
+            self.source_kind == Some(log_source::LogSourceKind::Adif),
+        );
+        let spots_enabled = source_policy.is_enabled(SourceId::ReverseBeaconNetwork);
         PublicState {
             api_version: 1,
             generated_at,
@@ -342,10 +377,9 @@ impl Runtime {
             import_diagnostics: self.import_diagnostics.clone(),
             source_diagnostics: self.source_diagnostics.clone(),
             spot_status: self.spot_status.clone(),
-            spots_enabled: self.spots_enabled,
-            assisted_warning: self.spots_enabled.then_some(
-                "Live spots/skimmers are prohibited for Single Operator. Keep them enabled only if entering Single Operator Assisted.",
-            ),
+            spots_enabled,
+            assisted_warning: source_policy.assisted_warning(),
+            source_capabilities: source_policy.statuses(),
             demo: self.demo,
             current_band,
             station_intelligence: station_intelligence(self.qsos.values(), generated_at),
@@ -361,6 +395,11 @@ impl Runtime {
             .collect();
         spots.sort_by_key(|spot| std::cmp::Reverse(spot.time));
         spots
+    }
+
+    fn spots_enabled(&self) -> bool {
+        self.source_policy
+            .is_enabled(SourceId::ReverseBeaconNetwork)
     }
 }
 
@@ -498,27 +537,7 @@ async fn main() -> Result<()> {
         .route("/api/operation", post(select_operation))
         .route("/api/demo", post(toggle_demo))
         .layer(DefaultBodyLimit::max(25 * 1024 * 1024))
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(|request: &axum::http::Request<_>| {
-                    info_span!(
-                        "http.request",
-                        method = %request.method(),
-                        path = %http_trace_path(request.uri())
-                    )
-                })
-                .on_response(
-                    |response: &axum::http::Response<_>,
-                     latency: Duration,
-                     _span: &tracing::Span| {
-                        info!(
-                            status = response.status().as_u16(),
-                            latency_ms = latency.as_millis(),
-                            "HTTP response"
-                        );
-                    },
-                ),
-        )
+        .layer(middleware::from_fn(trace_http_request))
         .with_state(state);
 
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), args.port);
@@ -707,7 +726,7 @@ struct DemoRequest {
 }
 
 async fn toggle_demo(State(state): State<AppState>, Json(request): Json<DemoRequest>) -> Response {
-    let spots_enabled = state.runtime.read().await.spots_enabled;
+    let spots_enabled = state.runtime.read().await.spots_enabled();
     let mut runtime = state.runtime.write().await;
     if request.enabled {
         *runtime = demo_runtime(spots_enabled, runtime.spot_policy, DemoScenario::Normal);
@@ -1054,7 +1073,11 @@ fn demo_runtime(spots_enabled: bool, spot_policy: SpotPolicy, scenario: DemoScen
         } else {
             "disabled — Single Operator safe".into()
         },
-        spots_enabled,
+        source_policy: {
+            let mut policy = SourcePolicy::default();
+            policy.set_enabled(SourceId::ReverseBeaconNetwork, spots_enabled);
+            policy
+        },
         spot_policy,
         demo: true,
     };
@@ -1221,11 +1244,53 @@ mod tests {
     }
 
     #[test]
+    fn public_assistance_warning_considers_every_live_source() {
+        let mut runtime = Runtime::normal(false, SpotPolicy::default(), None);
+        let default = runtime.public();
+        assert!(!default.spots_enabled);
+        assert_eq!(default.assisted_warning, None);
+
+        runtime
+            .source_policy
+            .set_enabled(SourceId::ContestOnlineScoreboard, true);
+        let scoreboard = runtime.public();
+        assert!(!scoreboard.spots_enabled);
+        assert!(
+            scoreboard
+                .assisted_warning
+                .unwrap()
+                .contains("Contest Online ScoreBoard")
+        );
+
+        runtime
+            .source_policy
+            .set_enabled(SourceId::ContestOnlineScoreboard, false);
+        runtime.source_kind = Some(log_source::LogSourceKind::Lofi);
+        let local_log = runtime.public();
+        assert_eq!(local_log.assisted_warning, None);
+        assert!(local_log.source_capabilities.iter().any(|source| {
+            source.id == SourceId::PoloLofi
+                && source.enabled
+                && source.capability == model::SourceCapability::LocalLog
+        }));
+    }
+
+    #[test]
     fn http_tracing_excludes_query_values() {
         let uri: Uri = "/api/state?email=private%40example.com&token=secret"
             .parse()
             .unwrap();
         assert_eq!(http_trace_path(&uri), "/api/state");
+    }
+
+    #[test]
+    fn http_tracing_quiets_only_successful_state_snapshots() {
+        assert!(quiet_http_response("/api/state", StatusCode::OK));
+        assert!(!quiet_http_response(
+            "/api/state",
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(!quiet_http_response("/healthz", StatusCode::OK));
     }
 
     #[test]

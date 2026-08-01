@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -107,6 +108,136 @@ pub enum EvidenceSource {
     CallHistory,
     Callbook,
     Prefix,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceId {
+    ReverseBeaconNetwork,
+    ContestOnlineScoreboard,
+    N1mmCallHistory,
+    PoloLofi,
+    AdifImport,
+    NaqpRules,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCapability {
+    LiveExternalAssistance,
+    StaticHistory,
+    LocalLog,
+    OfflineReference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceStatus {
+    pub id: SourceId,
+    pub label: &'static str,
+    pub capability: SourceCapability,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourcePolicy {
+    sources: BTreeMap<SourceId, SourceStatus>,
+}
+
+impl Default for SourcePolicy {
+    fn default() -> Self {
+        let sources = [
+            (
+                SourceId::ReverseBeaconNetwork,
+                "Reverse Beacon Network",
+                SourceCapability::LiveExternalAssistance,
+                false,
+            ),
+            (
+                SourceId::ContestOnlineScoreboard,
+                "Contest Online ScoreBoard",
+                SourceCapability::LiveExternalAssistance,
+                false,
+            ),
+            (
+                SourceId::N1mmCallHistory,
+                "N1MM Call History",
+                SourceCapability::StaticHistory,
+                false,
+            ),
+            (
+                SourceId::PoloLofi,
+                "Ham2K PoLo via LoFi",
+                SourceCapability::LocalLog,
+                false,
+            ),
+            (
+                SourceId::AdifImport,
+                "ADIF import",
+                SourceCapability::LocalLog,
+                false,
+            ),
+            (
+                SourceId::NaqpRules,
+                "NAQP rules and multiplier catalog",
+                SourceCapability::OfflineReference,
+                true,
+            ),
+        ]
+        .into_iter()
+        .map(|(id, label, capability, enabled)| {
+            (
+                id,
+                SourceStatus {
+                    id,
+                    label,
+                    capability,
+                    enabled,
+                },
+            )
+        })
+        .collect();
+        Self { sources }
+    }
+}
+
+impl SourcePolicy {
+    pub fn set_enabled(&mut self, id: SourceId, enabled: bool) {
+        if let Some(source) = self.sources.get_mut(&id) {
+            source.enabled = enabled;
+        }
+    }
+
+    pub fn is_enabled(&self, id: SourceId) -> bool {
+        self.sources.get(&id).is_some_and(|source| source.enabled)
+    }
+
+    pub fn statuses(&self) -> Vec<SourceStatus> {
+        self.sources.values().cloned().collect()
+    }
+
+    pub fn requires_assisted_entry(&self) -> bool {
+        self.sources.values().any(|source| {
+            source.enabled && source.capability == SourceCapability::LiveExternalAssistance
+        })
+    }
+
+    pub fn assisted_warning(&self) -> Option<String> {
+        if !self.requires_assisted_entry() {
+            return None;
+        }
+        let live_sources: Vec<_> = self
+            .sources
+            .values()
+            .filter(|source| {
+                source.enabled && source.capability == SourceCapability::LiveExternalAssistance
+            })
+            .map(|source| source.label)
+            .collect();
+        Some(format!(
+            "Live external assistance is enabled ({}). Enter Single Operator Assisted or another category that permits assistance.",
+            live_sources.join(", ")
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -465,6 +596,66 @@ mod evidence_tests {
         assert_eq!(
             station.location_at(time(0)).confidence,
             LocationConfidence::Unknown
+        );
+    }
+
+    #[test]
+    fn live_external_sources_are_disabled_by_default() {
+        let policy = SourcePolicy::default();
+        assert!(!policy.is_enabled(SourceId::ReverseBeaconNetwork));
+        assert!(!policy.is_enabled(SourceId::ContestOnlineScoreboard));
+        assert!(!policy.requires_assisted_entry());
+        assert_eq!(policy.assisted_warning(), None);
+    }
+
+    #[test]
+    fn any_enabled_live_external_source_requires_assistance() {
+        let mut policy = SourcePolicy::default();
+        policy.set_enabled(SourceId::ReverseBeaconNetwork, true);
+        assert!(policy.requires_assisted_entry());
+        assert!(
+            policy
+                .assisted_warning()
+                .unwrap()
+                .contains("Reverse Beacon Network")
+        );
+
+        policy.set_enabled(SourceId::ReverseBeaconNetwork, false);
+        policy.set_enabled(SourceId::ContestOnlineScoreboard, true);
+        assert!(policy.requires_assisted_entry());
+        assert!(
+            policy
+                .assisted_warning()
+                .unwrap()
+                .contains("Contest Online ScoreBoard")
+        );
+    }
+
+    #[test]
+    fn static_history_and_local_logs_do_not_trigger_assisted_category() {
+        let mut policy = SourcePolicy::default();
+        policy.set_enabled(SourceId::N1mmCallHistory, true);
+        policy.set_enabled(SourceId::PoloLofi, true);
+        policy.set_enabled(SourceId::AdifImport, true);
+
+        assert!(!policy.requires_assisted_entry());
+        assert_eq!(policy.assisted_warning(), None);
+        let statuses = policy.statuses();
+        assert_eq!(
+            statuses
+                .iter()
+                .find(|source| source.id == SourceId::N1mmCallHistory)
+                .unwrap()
+                .capability,
+            SourceCapability::StaticHistory
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .find(|source| source.id == SourceId::PoloLofi)
+                .unwrap()
+                .capability,
+            SourceCapability::LocalLog
         );
     }
 }

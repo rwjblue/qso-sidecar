@@ -157,6 +157,14 @@ connection unless `--rbn` (or `QSO_SIDECAR_RBN=true`) is explicitly set, and the
 dashboard shows a persistent warning whenever spots are enabled. The former `--no-rbn`
 option has been removed because disabled is now the default.
 
+Sidecar evaluates entry-category implications across every source, not just RBN. Source
+capabilities distinguish live external assistance, static history, local logs, and
+offline references. Any enabled live external source triggers the assisted-category
+warning; disabling RBN cannot suppress that warning while another live feed is active.
+Static user-imported history, PoLo/ADIF log data, and the bundled rules catalog do not by
+themselves require an assisted entry. The dashboard lists each active source and its
+capability.
+
 Spots never award QSO or multiplier credit. An exchange copied from a worked QSO on
 another band is labeled **verified needed**. An arbitrary RBN callsign without local-log
 evidence remains **unknown**; Sidecar does not infer contest participation or a
