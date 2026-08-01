@@ -3,8 +3,10 @@
 Sidecar connects to the RBN Telnet endpoint only when `--rbn` is explicitly enabled and
 a login callsign is supplied. Its default startup opens no cluster connection and is
 safe for an unassisted Single Operator entry. The RBN documents port 7000 as a combined CW and RTTY feed, so
-Sidecar accepts only well-formed DX lines carrying a numeric `WPM` observation. Other
-cluster output is ignored and is visible only with debug logging.
+Sidecar accepts only well-formed DX lines carrying a numeric `WPM` observation followed
+by an explicit `CQ` activity marker. Beacon, DX, non-CW, missing-activity, and ambiguous
+records are not candidates. Other cluster output is ignored and is visible only with
+debug logging.
 
 Candidates are bounded by configurable age, call/band/time/frequency deduplication,
 and total capacity. Aggregated candidates retain the newest observation, recent and

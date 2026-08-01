@@ -190,10 +190,16 @@ pub fn parse_line(line: &str, now: DateTime<Utc>) -> Option<RawSpot> {
         .windows(2)
         .find(|pair| pair[1].eq_ignore_ascii_case("dB"))
         .and_then(|pair| pair[0].parse().ok());
-    let speed_wpm = tokens
-        .windows(2)
-        .find(|pair| pair[1].eq_ignore_ascii_case("WPM"))
-        .and_then(|pair| pair[0].parse().ok())?;
+    let wpm_index = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("WPM"))?;
+    let speed_wpm = tokens.get(wpm_index.checked_sub(1)?)?.parse().ok()?;
+    if !tokens
+        .get(wpm_index + 1)
+        .is_some_and(|activity| activity.eq_ignore_ascii_case("CQ"))
+    {
+        return None;
+    }
     let time = tokens
         .iter()
         .find_map(|token| parse_hhmm(token, now))
@@ -281,6 +287,17 @@ mod tests {
         assert!(parse_line("DX de WZ7I-#: 14025.1 K1ABC 17 dB RTTY 1823Z", now()).is_none());
         assert!(parse_line("cluster login:", now()).is_none());
         assert!(parse_line("DX de WZ7I-#: nope K1ABC 17 dB 26 WPM 1823Z", now()).is_none());
+    }
+
+    #[test]
+    fn retains_only_unambiguous_cw_cq_reports() {
+        assert!(parse_line("DX de WZ7I-#: 14025.1 K1ABC 17 dB 26 WPM cq 1823Z", now()).is_some());
+        for activity in ["BEACON", "DX", "TEST"] {
+            let line = format!("DX de WZ7I-#: 14025.1 K1ABC 17 dB 26 WPM {activity} 1823Z");
+            assert!(parse_line(&line, now()).is_none(), "accepted {activity}");
+        }
+        assert!(parse_line("DX de WZ7I-#: 14025.1 K1ABC 17 dB 26 WPM 1823Z", now()).is_none());
+        assert!(parse_line("DX de WZ7I-#: 14025.1 K1ABC 17 dB RTTY CQ 1823Z", now()).is_none());
     }
 
     #[test]
