@@ -31,6 +31,9 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+const LOFI_LINK_POLL_INTERVAL: Duration = Duration::from_secs(8);
+const LOFI_SYNC_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
@@ -637,6 +640,7 @@ async fn run_lofi_sync(state: AppState) {
     let mut selected_seen: Option<String> = None;
     let mut watermark: Option<i64> = None;
     let mut registered = false;
+    let mut poll_interval = LOFI_LINK_POLL_INTERVAL;
     loop {
         let result: Result<()> = async {
             let account = if registered {
@@ -662,6 +666,11 @@ async fn run_lofi_sync(state: AppState) {
                     "client registered; link your PoLo account below".into()
                 };
             }
+            poll_interval = if account.linked {
+                LOFI_SYNC_POLL_INTERVAL
+            } else {
+                LOFI_LINK_POLL_INTERVAL
+            };
             if !account.linked {
                 state.updates.send(()).ok();
                 return Ok(());
@@ -733,7 +742,7 @@ async fn run_lofi_sync(state: AppState) {
             drop(runtime);
             state.updates.send(()).ok();
         }
-        tokio::time::sleep(Duration::from_secs(8)).await;
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
@@ -938,6 +947,9 @@ fn demo_runtime(spots_enabled: bool, spot_policy: SpotPolicy, scenario: DemoScen
         operations: vec![Operation {
             id: "demo-naqp".into(),
             title: "NAQP CW Demo Operation".into(),
+            station_call: Some("N1RWJ".into()),
+            subtitle: Some("Synthetic operation".into()),
+            qso_count: Some(6),
             start: Some(Utc.with_ymd_and_hms(2026, 8, 1, 18, 0, 0).unwrap()),
             end: None,
             is_naqp: true,

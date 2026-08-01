@@ -129,6 +129,9 @@ pub struct Spot {
 pub struct Operation {
     pub id: String,
     pub title: String,
+    pub station_call: Option<String>,
+    pub subtitle: Option<String>,
+    pub qso_count: Option<u64>,
     pub start: Option<DateTime<Utc>>,
     pub end: Option<DateTime<Utc>>,
     pub is_naqp: bool,

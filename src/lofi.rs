@@ -264,15 +264,42 @@ fn parse_operation(value: &Value) -> Option<Operation> {
                     .is_some_and(|kind| kind.eq_ignore_ascii_case("naqp"))
             })
         });
+    let station_call = value
+        .get("stationCallPlus")
+        .or_else(|| value.get("stationCall"))
+        .and_then(Value::as_str)
+        .filter(|call| !call.trim().is_empty())
+        .map(str::to_string);
+    let mut title_parts = Vec::new();
+    if let Some(title) = nonempty_string(value.get("userTitle")) {
+        title_parts.push(title);
+    }
+    if let Some(title) = nonempty_string(value.get("broaderTitle")) {
+        title_parts.push(title);
+    } else if let Some(title) = nonempty_string(value.get("title"))
+        && title != "New Operation"
+    {
+        title_parts.push(title);
+    }
+    let title = if title_parts.is_empty() {
+        if station_call.is_some() {
+            "General Operation".to_string()
+        } else {
+            "New Operation".to_string()
+        }
+    } else {
+        title_parts.join(" ")
+    };
     Some(Operation {
         id,
-        title: value
-            .get("userTitle")
-            .or_else(|| value.get("title"))
-            .or_else(|| value.get("broaderTitle"))
-            .and_then(Value::as_str)
-            .unwrap_or("Untitled operation")
-            .to_string(),
+        title,
+        station_call,
+        subtitle: nonempty_string(
+            value
+                .get("broaderSubtitle")
+                .or_else(|| value.get("subtitle")),
+        ),
+        qso_count: value.get("qsoCount").and_then(Value::as_u64),
         start: millis(value, &["startAtMillisMin", "createdAtMillis"]),
         end: millis(value, &["startAtMillisMax"]),
         is_naqp,
@@ -413,6 +440,14 @@ fn scalar_string(value: &Value) -> Option<String> {
         .or_else(|| value.as_u64().map(|value| value.to_string()))
 }
 
+fn nonempty_string(value: Option<&Value>) -> Option<String> {
+    value?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn millis(value: &Value, keys: &[&str]) -> Option<chrono::DateTime<Utc>> {
     keys.iter().find_map(|key| {
         value
@@ -490,12 +525,36 @@ mod tests {
         let operation = parse_operation(&json!({
             "uuid": 42,
             "userTitle": "NAQP CW",
+            "broaderTitle": "at Home",
+            "broaderSubtitle": "New Haven County, CT",
+            "stationCall": "N1RWJ",
+            "qsoCount": 37,
+            "startAtMillisMax": 1785607200000_i64,
             "refs": [{"type": "naqp", "mode": "CW", "extra": true}],
             "unknown": {"is": "preserved by caller"}
         }))
         .unwrap();
         assert_eq!(operation.id, "42");
+        assert_eq!(operation.title, "NAQP CW at Home");
+        assert_eq!(operation.station_call.as_deref(), Some("N1RWJ"));
+        assert_eq!(operation.subtitle.as_deref(), Some("New Haven County, CT"));
+        assert_eq!(operation.qso_count, Some(37));
+        assert!(operation.end.is_some());
         assert!(operation.is_naqp);
+    }
+
+    #[test]
+    fn gives_untitled_operations_the_same_fallback_as_polo() {
+        let general = parse_operation(&json!({
+            "uuid": "general",
+            "stationCall": "N1RWJ",
+            "title": "New Operation"
+        }))
+        .unwrap();
+        assert_eq!(general.title, "General Operation");
+
+        let unfinished = parse_operation(&json!({"uuid": "unfinished"})).unwrap();
+        assert_eq!(unfinished.title, "New Operation");
     }
 
     #[test]

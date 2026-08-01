@@ -117,7 +117,7 @@ mise run build
    operation containing a `naqp` reference. If needed, choose another operation from
    the dropdown.
 5. Sidecar fetches all pages of that operation's QSOs, then polls incrementally every
-   eight seconds. Updates and tombstones replace prior records by QSON UUID.
+   30 seconds. Updates and tombstones replace prior records by QSON UUID.
 
 The random LoFi client key, secret, and bearer token are stored only in the OS per-user
 application-data directory. The directory is mode `0700` and the credential file is
