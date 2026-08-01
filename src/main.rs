@@ -228,7 +228,6 @@ struct MatrixCell {
 #[serde(rename_all = "snake_case")]
 enum MatrixCellState {
     Needed,
-    PossibleSpotted,
     VerifiedSpotted,
     Unresolved,
     Worked,
@@ -378,13 +377,6 @@ fn build_multiplier_matrix(score: &naqp::Score, spots: &[Spot]) -> Vec<MatrixRow
                             && spot.predicted_multiplier.as_deref() == Some(row.id)
                     }) {
                         MatrixCellState::VerifiedSpotted
-                    } else if spots.iter().any(|spot| {
-                        !spot.stale
-                            && spot.band == band
-                            && spot.class == SpotClass::PossibleMultiplier
-                            && spot.predicted_multiplier.as_deref() == Some(row.id)
-                    }) {
-                        MatrixCellState::PossibleSpotted
                     } else {
                         MatrixCellState::Needed
                     };
@@ -960,15 +952,6 @@ fn demo_runtime(spots_enabled: bool, spot_policy: SpotPolicy, scenario: DemoScen
             3,
         ),
         demo_spot(
-            "W7RN",
-            Band::B20,
-            14_038.2,
-            SpotClass::PossibleMultiplier,
-            Some("NV"),
-            now - chrono::Duration::seconds(18),
-            2,
-        ),
-        demo_spot(
             "K3LR",
             Band::B20,
             14_026.8,
@@ -1376,6 +1359,10 @@ mod tests {
             classify_spot(&runtime, "N6RO", Band::B20),
             (SpotClass::VerifiedMultiplier, Some("CA".into()))
         );
+        assert_eq!(
+            classify_spot(&runtime, "W7RN", Band::B20),
+            (SpotClass::Unknown, None)
+        );
     }
 
     #[test]
@@ -1398,7 +1385,7 @@ mod tests {
         };
         assert_eq!(state_for("CT", Band::B20), MatrixCellState::Worked);
         assert_eq!(state_for("CA", Band::B20), MatrixCellState::VerifiedSpotted);
-        assert_eq!(state_for("NV", Band::B20), MatrixCellState::PossibleSpotted);
+        assert_eq!(state_for("NV", Band::B20), MatrixCellState::Needed);
         assert_eq!(state_for("MA", Band::B10), MatrixCellState::Needed);
 
         let unresolved = demo_runtime(

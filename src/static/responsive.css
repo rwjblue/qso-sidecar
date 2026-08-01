@@ -5,7 +5,6 @@
 #matrix td:first-child strong{display:inline-block;min-width:42px;color:var(--text)}
 #matrix td:first-child span{color:var(--muted);font-family:system-ui,sans-serif}
 #matrix td.verified_spotted{color:var(--cyan);font-weight:800;background:#12374680}
-#matrix td.possible_spotted{color:var(--amber);font-weight:800;background:#3b2d105c}
 #matrix td.unresolved{color:var(--red);font-weight:800;background:#3d182080}
 .spot.stale{opacity:.55}
 

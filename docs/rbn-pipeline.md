@@ -35,9 +35,12 @@ only after the server acknowledges the login or emits a valid CQ spot. Stop Side
 repeat once to exercise a fresh session, and do not attach captured live output to bug
 reports because it may include operator callsigns.
 
-## Exchange inference policy
+## Classification evidence policy
 
-Sidecar does not ship a callsign-history database and does not infer multiplier credit.
+Sidecar does not ship a callsign-history database and does not infer NAQP participation,
+location, or multiplier credit from an arbitrary RBN callsign. A candidate is shown as
+a verified multiplier only when a prior QSO in the operator's local log supplies a
+resolvable exchange; without that evidence it remains unknown.
 The official [NCJ results search](https://ncjweb.com/naqpscores/) contains historical
 submitted score/QTH data, not a versioned current call-history artifact with an
 identified reuse license. [NCJ has also cautioned](https://ncjweb.com/naqp-scores/ssbnaqp082022.pdf)

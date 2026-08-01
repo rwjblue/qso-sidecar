@@ -101,7 +101,6 @@ impl Qso {
 #[serde(rename_all = "snake_case")]
 pub enum SpotClass {
     VerifiedMultiplier,
-    PossibleMultiplier,
     NeededQso,
     Worked,
     Unknown,

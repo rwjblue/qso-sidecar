@@ -158,9 +158,10 @@ dashboard shows a persistent warning whenever spots are enabled. The former `--n
 option has been removed because disabled is now the default.
 
 Spots never award QSO or multiplier credit. An exchange copied from a worked QSO on
-another band is labeled **verified needed**; inference is explicitly labeled possible.
-See [`docs/rbn-pipeline.md`](docs/rbn-pipeline.md) for aggregation, expiry, and the
-call-history inference policy.
+another band is labeled **verified needed**. An arbitrary RBN callsign without local-log
+evidence remains **unknown**; Sidecar does not infer contest participation or a
+multiplier. See [`docs/rbn-pipeline.md`](docs/rbn-pipeline.md) for aggregation, expiry,
+and the classification evidence policy.
 
 ## Configuration
 
