@@ -516,9 +516,46 @@ fn truncate(value: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use axum::Router;
+    use axum::extract::Query;
+    use axum::http::{HeaderMap, StatusCode as AxumStatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::{get, post};
     use serde_json::json;
+    use tokio::sync::Mutex as TokioMutex;
 
     use super::*;
+
+    fn test_client(base: String, directory: &Path, token: Option<&str>) -> LofiClient {
+        let credentials_path = directory.join("lofi-credentials.json");
+        let credentials = Credentials {
+            key: "browser:test-key".into(),
+            secret: "test-secret".into(),
+            token: token.map(str::to_string),
+        };
+        save_credentials(&credentials_path, &credentials).unwrap();
+        LofiClient {
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .unwrap(),
+            base,
+            credentials: Arc::new(Mutex::new(credentials)),
+            credentials_path,
+        }
+    }
+
+    async fn fake_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), server)
+    }
 
     #[test]
     fn parses_flexible_operation_response() {
@@ -623,5 +660,164 @@ mod tests {
         assert_eq!(saved.key, "second-key");
         assert_eq!(saved.token.as_deref(), Some("linked"));
         assert!(!path.with_extension("tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn qso_pagination_preserves_since_and_advances_cursor_once() {
+        let queries = Arc::new(TokioMutex::new(Vec::<BTreeMap<String, String>>::new()));
+        let observed_queries = queries.clone();
+        let app = Router::new().route(
+            "/v1/operations/op-1/qsos",
+            get(move |Query(query): Query<BTreeMap<String, String>>| {
+                let queries = observed_queries.clone();
+                async move {
+                    queries.lock().await.push(query.clone());
+                    if !query.contains_key("syncedUntilMillis") {
+                        axum::Json(json!({
+                            "qsos": [{
+                                "uuid": "first",
+                                "their": {"call": "K1ABC"},
+                                "band": "20m",
+                                "mode": "CW",
+                                "startAtMillis": 1785607200000_i64
+                            }],
+                            "meta": {"qsos": {
+                                "records_left": 1,
+                                "next_synced_until_millis": 123
+                            }}
+                        }))
+                    } else {
+                        axum::Json(json!({
+                            "qsos": [{
+                                "uuid": "second",
+                                "their": {"call": "W1AW"},
+                                "band": "40m",
+                                "mode": "CW",
+                                "startAtMillis": 1785607260000_i64
+                            }],
+                            "meta": {"qsos": {
+                                "records_left": 1,
+                                "next_synced_until_millis": 123
+                            }}
+                        }))
+                    }
+                }
+            }),
+        );
+        let (base, server) = fake_server(app).await;
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client(base, directory.path(), Some("linked-token"));
+
+        let batch = client.qsos("op-1", Some(100)).await.unwrap();
+        server.abort();
+
+        assert_eq!(
+            batch
+                .qsos
+                .iter()
+                .map(|qso| qso.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        let queries = queries.lock().await;
+        assert_eq!(queries.len(), 2, "repeated cursors must not loop");
+        assert_eq!(
+            queries[0].get("syncedSinceMillis").map(String::as_str),
+            Some("100")
+        );
+        assert_eq!(queries[0].get("limit").map(String::as_str), Some("50"));
+        assert_eq!(
+            queries[1].get("syncedSinceMillis").map(String::as_str),
+            Some("100")
+        );
+        assert_eq!(
+            queries[1].get("syncedUntilMillis").map(String::as_str),
+            Some("123")
+        );
+        assert_eq!(queries[1].get("limit").map(String::as_str), Some("200"));
+    }
+
+    #[tokio::test]
+    async fn protected_request_reregisters_once_after_unauthorized() {
+        let account_attempts = Arc::new(TokioMutex::new(Vec::<String>::new()));
+        let observed_attempts = account_attempts.clone();
+        let app = Router::new()
+            .route(
+                "/v1/accounts",
+                get(move |headers: HeaderMap| {
+                    let attempts = observed_attempts.clone();
+                    async move {
+                        let authorization = headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        attempts.lock().await.push(authorization.clone());
+                        if authorization == "Bearer refreshed-token" {
+                            (
+                                AxumStatusCode::OK,
+                                axum::Json(json!({
+                                    "current_account": {"call": "N1RWJ"}
+                                })),
+                            )
+                                .into_response()
+                        } else {
+                            AxumStatusCode::UNAUTHORIZED.into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/client",
+                post(|| async {
+                    axum::Json(json!({
+                        "token": "refreshed-token",
+                        "account": {"call": "N1RWJ"}
+                    }))
+                }),
+            );
+        let (base, server) = fake_server(app).await;
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client(base, directory.path(), Some("expired-token"));
+
+        let account = client.account().await.unwrap();
+        server.abort();
+
+        assert!(account.linked);
+        assert_eq!(account.account_call.as_deref(), Some("N1RWJ"));
+        assert_eq!(
+            account_attempts.lock().await.as_slice(),
+            ["Bearer expired-token", "Bearer refreshed-token"]
+        );
+        assert_eq!(
+            client.credentials.lock().await.token.as_deref(),
+            Some("refreshed-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_saved_identity_is_replaced_without_retrying_secret() {
+        let app = Router::new().route(
+            "/v1/client",
+            post(|| async { AxumStatusCode::UNAUTHORIZED }),
+        );
+        let (base, server) = fake_server(app).await;
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client(base, directory.path(), None);
+
+        let error = client.register().await.unwrap_err();
+        server.abort();
+
+        assert!(error.to_string().contains("created a new identity"));
+        let credentials = client.credentials.lock().await;
+        assert_ne!(credentials.key, "browser:test-key");
+        assert_ne!(credentials.secret, "test-secret");
+        assert_eq!(credentials.token, None);
+        let saved: Credentials = serde_json::from_slice(
+            &fs::read(directory.path().join("lofi-credentials.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved.key, credentials.key);
+        assert_eq!(saved.secret, credentials.secret);
     }
 }
