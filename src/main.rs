@@ -109,6 +109,7 @@ enum DemoScenario {
     RbnDisconnected,
     MalformedImport,
     UnresolvedExchange,
+    ProblemQsos,
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +271,7 @@ struct PublicState {
     demo: bool,
     current_band: Option<Band>,
     station_intelligence: Vec<StationIntelligence>,
+    problem_findings: Vec<ProblemFinding>,
 }
 
 #[derive(Debug, Serialize)]
@@ -279,6 +281,40 @@ struct StationIntelligence {
     activity: ActivityConclusion,
     name: NameConclusion,
     location: LocationConclusion,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FindingSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum FindingCategory {
+    Excluded,
+    Duplicate,
+    Unresolved,
+    Malformed,
+}
+
+#[derive(Debug, Serialize)]
+struct ProblemFinding {
+    id: String,
+    severity: FindingSeverity,
+    category: FindingCategory,
+    call: Option<String>,
+    timestamp: Option<DateTime<Utc>>,
+    band: Option<Band>,
+    frequency_khz: Option<f64>,
+    received_exchange: Option<String>,
+    source: String,
+    source_record_id: String,
+    reason: String,
+    explanation: String,
+    suggested_next_step: String,
+    evidence: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -428,6 +464,12 @@ impl Runtime {
                 SpotFeedState::Live
             }
         };
+        let problem_findings = build_problem_findings(
+            &score,
+            &self.qsos,
+            self.source_kind,
+            &self.source_diagnostics,
+        );
         PublicState {
             api_version: 1,
             generated_at,
@@ -461,6 +503,7 @@ impl Runtime {
                 generated_at,
                 self.spot_policy.ttl,
             ),
+            problem_findings,
         }
     }
 
@@ -650,6 +693,151 @@ fn station_evidence<'a>(
         });
     }
     stations
+}
+
+fn source_label(source_kind: Option<log_source::LogSourceKind>) -> &'static str {
+    match source_kind {
+        Some(log_source::LogSourceKind::Lofi) => "polo_lofi",
+        Some(log_source::LogSourceKind::Adif) => "adif_import",
+        None => "normalized_log",
+    }
+}
+
+fn qso_reason(reason: naqp::QsoReason) -> (&'static str, &'static str, &'static str) {
+    match reason {
+        naqp::QsoReason::DuplicateCallOnBand => (
+            "duplicate_call_on_band",
+            "The same callsign was already credited on this band.",
+            "Confirm both contacts in the authoritative logger; no Sidecar edit was made.",
+        ),
+        naqp::QsoReason::IncompleteExchange => (
+            "incomplete_exchange",
+            "The received name or location could not be resolved into a complete NAQP exchange.",
+            "Review the received exchange in the authoritative logger.",
+        ),
+        naqp::QsoReason::WrongMode => (
+            "wrong_mode",
+            "The contact mode is not eligible for NAQP CW.",
+            "Confirm that the correct contest operation and mode were selected.",
+        ),
+        naqp::QsoReason::IneligibleBand => (
+            "ineligible_band",
+            "The contact does not resolve to an eligible contest band.",
+            "Review its band or frequency in the authoritative logger.",
+        ),
+        naqp::QsoReason::OutsideContestPeriod => (
+            "outside_contest_period",
+            "The contact timestamp is outside the configured event period.",
+            "Confirm the operation selection, timestamp, and station clock.",
+        ),
+        naqp::QsoReason::Tombstone => (
+            "tombstone",
+            "The source marks this contact as deleted.",
+            "No action is needed unless the deletion was unintended in the logger.",
+        ),
+        naqp::QsoReason::Credited => (
+            "credited",
+            "The contact is credited.",
+            "No action is needed.",
+        ),
+    }
+}
+
+fn build_problem_findings(
+    score: &naqp::Score,
+    qsos: &BTreeMap<String, Qso>,
+    source_kind: Option<log_source::LogSourceKind>,
+    diagnostics: &[model::RecordDiagnostic],
+) -> Vec<ProblemFinding> {
+    let source = source_label(source_kind);
+    let mut findings = Vec::new();
+    for scored in score
+        .qsos
+        .iter()
+        .filter(|qso| qso.status != naqp::QsoStatus::Valid)
+    {
+        let Some(qso) = qsos.get(&scored.id) else {
+            continue;
+        };
+        let (reason, explanation, suggested_next_step) = qso_reason(scored.reason);
+        let category = match scored.status {
+            naqp::QsoStatus::Duplicate => FindingCategory::Duplicate,
+            naqp::QsoStatus::Unresolved => FindingCategory::Unresolved,
+            naqp::QsoStatus::Excluded => FindingCategory::Excluded,
+            naqp::QsoStatus::Valid => continue,
+        };
+        let severity = if category == FindingCategory::Excluded {
+            FindingSeverity::Error
+        } else {
+            FindingSeverity::Warning
+        };
+        let received_exchange = [qso.name.as_deref(), qso.location.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter(|value| !value.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut evidence = Vec::new();
+        if let Some(multiplier_id) = scored.multiplier_id {
+            evidence.push(format!(
+                "Resolved multiplier {} to stable identity {multiplier_id}.",
+                scored.multiplier.as_deref().unwrap_or("unknown")
+            ));
+        } else if scored.multiplier.as_deref() == Some("HI") {
+            evidence.push(
+                "HI is ambiguous: US-HI identifies Hawaii; DXCC-HI identifies Dominican Republic."
+                    .into(),
+            );
+        }
+        findings.push(ProblemFinding {
+            id: format!("qso:{}", scored.id),
+            severity,
+            category,
+            call: Some(qso.normalized_call()),
+            timestamp: Some(qso.timestamp),
+            band: qso.band,
+            frequency_khz: qso.frequency_khz,
+            received_exchange: (!received_exchange.is_empty()).then_some(received_exchange),
+            source: source.into(),
+            source_record_id: scored.id.clone(),
+            reason: reason.into(),
+            explanation: explanation.into(),
+            suggested_next_step: suggested_next_step.into(),
+            evidence,
+        });
+    }
+    for (index, diagnostic) in diagnostics.iter().enumerate() {
+        let source_record_id = diagnostic
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("diagnostic-{}", index + 1));
+        findings.push(ProblemFinding {
+            id: format!("source:{source_record_id}"),
+            severity: FindingSeverity::Error,
+            category: FindingCategory::Malformed,
+            call: None,
+            timestamp: None,
+            band: None,
+            frequency_khz: None,
+            received_exchange: None,
+            source: source.into(),
+            source_record_id,
+            reason: format!("{:?}", diagnostic.reason).to_ascii_lowercase(),
+            explanation: diagnostic.detail.clone(),
+            suggested_next_step:
+                "Review the identified source record; Sidecar did not change the source file."
+                    .into(),
+            evidence: Vec::new(),
+        });
+    }
+    findings.sort_by_key(|finding| {
+        (
+            finding.severity != FindingSeverity::Error,
+            std::cmp::Reverse(finding.timestamp),
+            finding.id.clone(),
+        )
+    });
+    findings
 }
 
 fn build_multiplier_matrix(score: &naqp::Score, spots: &[Spot]) -> Vec<MatrixRow> {
@@ -1538,6 +1726,78 @@ fn demo_runtime(spots_enabled: bool, spot_policy: SpotPolicy, scenario: DemoScen
             };
             runtime.qsos.insert(qso.id.clone(), qso);
         }
+        DemoScenario::ProblemQsos => {
+            let problems = [
+                Qso {
+                    id: "demo-duplicate".into(),
+                    call: "W1AW".into(),
+                    timestamp: Utc.with_ymd_and_hms(2026, 8, 1, 20, 30, 0).unwrap(),
+                    band: Some(Band::B20),
+                    frequency_khz: Some(14_035.0),
+                    mode: "CW".into(),
+                    name: Some("AL".into()),
+                    location: Some("CT".into()),
+                    country: Some("United States".into()),
+                    dxcc: Some(291),
+                    contest_id: Some("NAQP-CW".into()),
+                    deleted: false,
+                    raw: Value::Null,
+                },
+                Qso {
+                    id: "demo-unresolved".into(),
+                    call: "K1BAD".into(),
+                    timestamp: Utc.with_ymd_and_hms(2026, 8, 1, 20, 31, 0).unwrap(),
+                    band: Some(Band::B20),
+                    frequency_khz: Some(14_040.0),
+                    mode: "CW".into(),
+                    name: None,
+                    location: Some("MA".into()),
+                    country: Some("United States".into()),
+                    dxcc: Some(291),
+                    contest_id: Some("NAQP-CW".into()),
+                    deleted: false,
+                    raw: Value::Null,
+                },
+                Qso {
+                    id: "demo-hawaii".into(),
+                    call: "KH6ABC".into(),
+                    timestamp: Utc.with_ymd_and_hms(2026, 8, 1, 20, 32, 0).unwrap(),
+                    band: Some(Band::B20),
+                    frequency_khz: Some(14_041.0),
+                    mode: "SSB".into(),
+                    name: Some("KAI".into()),
+                    location: Some("HI".into()),
+                    country: Some("Hawaii".into()),
+                    dxcc: Some(110),
+                    contest_id: Some("NAQP-CW".into()),
+                    deleted: false,
+                    raw: Value::Null,
+                },
+                Qso {
+                    id: "demo-dominican".into(),
+                    call: "HI8ABC".into(),
+                    timestamp: Utc.with_ymd_and_hms(2026, 8, 1, 20, 33, 0).unwrap(),
+                    band: Some(Band::B20),
+                    frequency_khz: Some(14_042.0),
+                    mode: "SSB".into(),
+                    name: Some("ANA".into()),
+                    location: Some("HI".into()),
+                    country: Some("Dominican Republic".into()),
+                    dxcc: Some(72),
+                    contest_id: Some("NAQP-CW".into()),
+                    deleted: false,
+                    raw: Value::Null,
+                },
+            ];
+            runtime
+                .qsos
+                .extend(problems.into_iter().map(|qso| (qso.id.clone(), qso)));
+            runtime.source_diagnostics.push(model::RecordDiagnostic {
+                id: Some("demo-malformed-record".into()),
+                reason: model::RecordReason::MalformedRecord,
+                detail: "A synthetic source record is missing a valid timestamp.".into(),
+            });
+        }
     }
     runtime
 }
@@ -1777,6 +2037,37 @@ mod tests {
         assert_eq!(degraded.spot_feed_state, SpotFeedState::Degraded);
         let disabled = demo_runtime(false, SpotPolicy::default(), DemoScenario::Normal).public();
         assert_eq!(disabled.spot_feed_state, SpotFeedState::Disabled);
+    }
+
+    #[test]
+    fn problem_qso_demo_exposes_all_review_categories_and_stable_hi_identities() {
+        let public = demo_runtime(true, SpotPolicy::default(), DemoScenario::ProblemQsos).public();
+        let categories: BTreeSet<_> = public
+            .problem_findings
+            .iter()
+            .map(|finding| finding.category)
+            .collect();
+        assert_eq!(
+            categories,
+            BTreeSet::from([
+                FindingCategory::Excluded,
+                FindingCategory::Duplicate,
+                FindingCategory::Unresolved,
+                FindingCategory::Malformed,
+            ])
+        );
+        let evidence = public
+            .problem_findings
+            .iter()
+            .flat_map(|finding| finding.evidence.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(evidence.contains("US-HI"));
+        assert!(evidence.contains("DXCC-HI"));
+        assert!(public.problem_findings.iter().all(|finding| {
+            !finding.source_record_id.is_empty() && !finding.suggested_next_step.is_empty()
+        }));
     }
 
     #[test]

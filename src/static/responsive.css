@@ -28,6 +28,8 @@
   .spots-panel{height:430px}
   .spots{height:290px}
   .filters{overflow-x:auto}
+  .finding-filters{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .finding-actions{grid-column:span 2}
 }
 
 @media(max-width:620px){
@@ -39,6 +41,9 @@
   #matrix td:first-child{width:66px;padding-left:8px}
   #matrix td:first-child span{display:none}
   .spot{grid-template-columns:80px 1fr 70px;padding-inline:8px}
+  .finding-filters{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .finding-actions{grid-column:span 2}
+  .finding summary{grid-template-columns:58px 80px 1fr}.finding summary span:last-child{grid-column:2/-1}.finding-detail{padding-left:14px}
   .source-panel>p,.source-panel>form,.source-panel>select,.source-panel>label,.source-panel>.drop-zone{margin-inline:10px}
 }
 

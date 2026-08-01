@@ -65,6 +65,19 @@
         </section>
       </aside>
     </div>
+    <section class="panel findings-panel" aria-labelledby="findings-title">
+      <div class="panel-head"><div><p class="eyebrow">READ-ONLY REVIEW</p><h2 id="findings-title">Problem QSOs</h2></div><span id="finding-count" class="pill neutral">0 findings</span></div>
+      <p class="findings-note">Advisory only. Sidecar never edits the logger or source file.</p>
+      <div id="finding-filters" class="finding-filters">
+        <label>Search callsign<input id="finding-search" type="search" autocomplete="off" placeholder="Callsign"></label>
+        <label>Severity<select id="finding-severity"><option value="">All</option><option value="error">Errors</option><option value="warning">Warnings</option></select></label>
+        <label>Reason<select id="finding-reason"><option value="">All reasons</option></select></label>
+        <label>Band<select id="finding-band"><option value="">All bands</option></select></label>
+        <label>Source<select id="finding-source"><option value="">All sources</option></select></label>
+        <div class="finding-actions"><button id="copy-findings" type="button">Copy summary</button><button id="download-findings" type="button">Download .txt</button></div>
+      </div>
+      <div id="findings" class="findings"></div>
+    </section>
   </main>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <script src="/app.js" defer></script>
