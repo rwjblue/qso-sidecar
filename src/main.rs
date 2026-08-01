@@ -487,13 +487,24 @@ fn spawn_cluster(state: AppState, address: String, login_call: Option<String>) {
         while let Some(event) = rx.recv().await {
             let mut runtime = state.runtime.write().await;
             match event {
-                rbn::ClusterEvent::Status(status) => runtime.spot_status = status,
+                rbn::ClusterEvent::Status { state, message } => {
+                    update_cluster_status(&mut runtime, state, message)
+                }
                 rbn::ClusterEvent::Spot(raw) => merge_spot(&mut runtime, raw),
             }
             drop(runtime);
             state.updates.send(()).ok();
         }
     });
+}
+
+fn update_cluster_status(runtime: &mut Runtime, state: rbn::ConnectionState, message: String) {
+    runtime.spot_status = message;
+    if state.candidates_are_stale() {
+        for spot in &mut runtime.spots {
+            spot.stale = true;
+        }
+    }
 }
 
 fn merge_spot(runtime: &mut Runtime, raw: rbn::RawSpot) {
@@ -511,6 +522,7 @@ fn merge_spot(runtime: &mut Runtime, raw: rbn::RawSpot) {
         existing.snr_db = raw.snr_db.or(existing.snr_db);
         existing.speed_wpm = raw.speed_wpm.or(existing.speed_wpm);
         existing.reports += 1;
+        existing.stale = false;
         return;
     }
     let (class, predicted_multiplier) = classify_spot(runtime, &raw.call, raw.band);
@@ -531,6 +543,7 @@ fn merge_spot(runtime: &mut Runtime, raw: rbn::RawSpot) {
         class,
         predicted_multiplier,
         reports: 1,
+        stale: false,
     });
     runtime.spots.truncate(200);
 }
@@ -688,6 +701,7 @@ fn demo_spot(
         class,
         predicted_multiplier: multiplier.map(str::to_string),
         reports,
+        stale: false,
     }
 }
 
@@ -713,4 +727,60 @@ async fn shutdown_signal() {
         () = terminate => {},
     }
     info!("shutting down");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disconnect_marks_existing_candidates_stale() {
+        let mut runtime = demo_runtime(true);
+
+        update_cluster_status(
+            &mut runtime,
+            rbn::ConnectionState::Degraded,
+            "disconnected".into(),
+        );
+
+        assert!(runtime.spots.iter().all(|spot| spot.stale));
+    }
+
+    #[test]
+    fn refreshed_candidate_is_no_longer_stale() {
+        let mut runtime = demo_runtime(true);
+        update_cluster_status(
+            &mut runtime,
+            rbn::ConnectionState::Disconnected,
+            "disconnected".into(),
+        );
+        let existing = runtime.spots.front().unwrap().clone();
+
+        merge_spot(
+            &mut runtime,
+            rbn::RawSpot {
+                call: existing.call.clone(),
+                frequency_khz: existing.frequency_khz,
+                band: existing.band,
+                time: existing.time + chrono::Duration::seconds(1),
+                spotter: existing.spotter.clone(),
+                snr_db: existing.snr_db,
+                speed_wpm: existing.speed_wpm,
+            },
+        );
+
+        let refreshed = runtime
+            .spots
+            .iter()
+            .find(|spot| spot.call == existing.call && spot.band == existing.band)
+            .unwrap();
+        assert!(!refreshed.stale);
+        assert!(
+            runtime
+                .spots
+                .iter()
+                .filter(|spot| spot.id != refreshed.id)
+                .all(|spot| spot.stale)
+        );
+    }
 }

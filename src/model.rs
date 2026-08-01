@@ -120,6 +120,7 @@ pub struct Spot {
     pub class: SpotClass,
     pub predicted_multiplier: Option<String>,
     pub reports: u32,
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

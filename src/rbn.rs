@@ -26,35 +26,72 @@ pub struct RawSpot {
 
 #[derive(Debug)]
 pub enum ClusterEvent {
-    Status(String),
+    Status {
+        state: ConnectionState,
+        message: String,
+    },
     Spot(RawSpot),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    Connecting,
+    Connected,
+    Degraded,
+    Disconnected,
+}
+
+impl ConnectionState {
+    pub fn candidates_are_stale(self) -> bool {
+        matches!(self, Self::Degraded | Self::Disconnected)
+    }
 }
 
 pub async fn run(address: String, login_call: Option<String>, tx: mpsc::Sender<ClusterEvent>) {
     let mut backoff = Duration::from_secs(1);
     loop {
+        let mut connected = false;
         let _ = tx
-            .send(ClusterEvent::Status(format!("connecting to {address}")))
+            .send(ClusterEvent::Status {
+                state: ConnectionState::Connecting,
+                message: format!("connecting to {address}"),
+            })
             .await;
-        match connection(&address, login_call.as_deref(), &tx).await {
+        match connection(&address, login_call.as_deref(), &tx, &mut connected).await {
             Ok(()) => warn!(%address, "cluster connection ended"),
             Err(error) => warn!(%address, %error, "cluster connection failed"),
         }
+        let state = if connected {
+            ConnectionState::Degraded
+        } else {
+            ConnectionState::Disconnected
+        };
+        let (delay, next_backoff) = retry_backoff(backoff, connected);
         let _ = tx
-            .send(ClusterEvent::Status(format!(
-                "disconnected; retrying in {}s",
-                backoff.as_secs()
-            )))
+            .send(ClusterEvent::Status {
+                state,
+                message: format!("disconnected; retrying in {}s", delay.as_secs()),
+            })
             .await;
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(60));
+        tokio::time::sleep(delay).await;
+        backoff = next_backoff;
     }
+}
+
+fn retry_backoff(previous: Duration, connected: bool) -> (Duration, Duration) {
+    let delay = if connected {
+        Duration::from_secs(1)
+    } else {
+        previous
+    };
+    (delay, (delay * 2).min(Duration::from_secs(60)))
 }
 
 async fn connection(
     address: &str,
     login_call: Option<&str>,
     tx: &mpsc::Sender<ClusterEvent>,
+    connected: &mut bool,
 ) -> Result<()> {
     let stream = TcpStream::connect(address)
         .await
@@ -64,9 +101,11 @@ async fn connection(
         write.write_all(call.as_bytes()).await?;
         write.write_all(b"\r\n").await?;
     }
-    tx.send(ClusterEvent::Status(
-        "connected; live RBN spots enabled".into(),
-    ))
+    *connected = true;
+    tx.send(ClusterEvent::Status {
+        state: ConnectionState::Connected,
+        message: "connected; live RBN spots enabled".into(),
+    })
     .await
     .ok();
     info!(%address, "cluster connected");
@@ -214,5 +253,25 @@ mod tests {
         let mut dedupe = Deduplicator::default();
         assert!(dedupe.accept(&first, chrono::Duration::seconds(90)));
         assert!(!dedupe.accept(&second, chrono::Duration::seconds(90)));
+    }
+
+    #[test]
+    fn disconnected_and_degraded_states_stale_candidates() {
+        assert!(!ConnectionState::Connecting.candidates_are_stale());
+        assert!(!ConnectionState::Connected.candidates_are_stale());
+        assert!(ConnectionState::Degraded.candidates_are_stale());
+        assert!(ConnectionState::Disconnected.candidates_are_stale());
+    }
+
+    #[test]
+    fn successful_connection_resets_retry_backoff() {
+        assert_eq!(
+            retry_backoff(Duration::from_secs(60), true),
+            (Duration::from_secs(1), Duration::from_secs(2))
+        );
+        assert_eq!(
+            retry_backoff(Duration::from_secs(60), false),
+            (Duration::from_secs(60), Duration::from_secs(60))
+        );
     }
 }
