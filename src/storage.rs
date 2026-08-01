@@ -116,6 +116,10 @@ fn write_atomic(path: &Path, body: &[u8]) -> Result<()> {
         .context("writing temporary last-good state")?;
     file.sync_all()
         .context("syncing temporary last-good state")?;
+    #[cfg(windows)]
+    if path.exists() {
+        fs::remove_file(path).context("removing previous last-good state")?;
+    }
     fs::rename(&temporary, path).context("installing last-good state")?;
     #[cfg(unix)]
     {
@@ -161,6 +165,18 @@ mod tests {
 
         assert_eq!(restored.source, "first");
         assert_eq!(restored.selected_operation.as_deref(), Some("operation"));
+    }
+
+    #[test]
+    fn replaces_existing_state_without_leaving_a_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let store = StateStore::at(path.clone()).unwrap();
+        store.save(&state("first")).unwrap();
+        store.save(&state("second")).unwrap();
+
+        assert_eq!(store.load().unwrap().unwrap().source, "second");
+        assert!(!path.with_extension("tmp").exists());
     }
 
     #[test]

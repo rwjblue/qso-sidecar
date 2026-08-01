@@ -458,6 +458,10 @@ fn save_credentials(path: &Path, credentials: &Credentials) -> Result<()> {
     let mut file = options.open(&temporary)?;
     file.write_all(&serde_json::to_vec(credentials)?)?;
     file.sync_all()?;
+    #[cfg(windows)]
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
     fs::rename(temporary, path)?;
     #[cfg(unix)]
     {
@@ -536,5 +540,29 @@ mod tests {
             "uuid":"missing-time", "their":{"call":"W1AW"}
         }));
         assert_eq!(missing_time.reason, RecordReason::MissingTimestamp);
+    }
+
+    #[test]
+    fn credentials_can_be_replaced_without_leaving_a_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credentials.json");
+        let first = Credentials {
+            key: "first-key".into(),
+            secret: "first-secret".into(),
+            token: None,
+        };
+        let second = Credentials {
+            key: "second-key".into(),
+            secret: "second-secret".into(),
+            token: Some("linked".into()),
+        };
+
+        save_credentials(&path, &first).unwrap();
+        save_credentials(&path, &second).unwrap();
+
+        let saved: Credentials = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.key, "second-key");
+        assert_eq!(saved.token.as_deref(), Some("linked"));
+        assert!(!path.with_extension("tmp").exists());
     }
 }

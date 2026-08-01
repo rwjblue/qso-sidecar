@@ -11,6 +11,68 @@ The dashboard loads no third-party frontend assets at runtime.
 
 ![QSO Sidecar dashboard showing synthetic NAQP CW demo data](docs/qso-sidecar-demo.jpg)
 
+## Install a prebuilt release
+
+[Tagged releases](https://github.com/rwjblue/qso-sidecar/releases) provide unsigned,
+self-contained archives that do not require Rust, mise, Bash, or WSL:
+
+| System | Target |
+| --- | --- |
+| Windows 10/11 x64 | `x86_64-pc-windows-msvc` |
+| Apple Silicon macOS | `aarch64-apple-darwin` |
+| Intel macOS | `x86_64-apple-darwin` |
+| Linux x64 | `x86_64-unknown-linux-musl` |
+
+On Windows PowerShell, replace `0.1.0` with the release version:
+
+```powershell
+$Version = "0.1.0"
+$Archive = "qso-sidecar-v$Version-x86_64-pc-windows-msvc.zip"
+$Base = "https://github.com/rwjblue/qso-sidecar/releases/download/v$Version"
+Invoke-WebRequest "$Base/$Archive" -OutFile $Archive
+Invoke-WebRequest "$Base/SHA256SUMS.txt" -OutFile SHA256SUMS.txt
+$Expected = ((Select-String -Path SHA256SUMS.txt -Pattern $Archive).Line -split "\s+")[0]
+$Actual = (Get-FileHash -Algorithm SHA256 $Archive).Hash
+if ($Actual -ne $Expected) { throw "SHA-256 checksum mismatch" }
+Expand-Archive $Archive -DestinationPath qso-sidecar
+./qso-sidecar/qso-sidecar.exe --no-rbn
+```
+
+On macOS, choose the target automatically and verify with `shasum`:
+
+```bash
+version=0.1.0
+if [[ "$(uname -m)" == arm64 ]]; then target=aarch64-apple-darwin; else target=x86_64-apple-darwin; fi
+archive="qso-sidecar-v${version}-${target}.tar.gz"
+base="https://github.com/rwjblue/qso-sidecar/releases/download/v${version}"
+curl -LO "$base/$archive" -LO "$base/SHA256SUMS.txt"
+grep "  $archive$" SHA256SUMS.txt | shasum -a 256 -c -
+tar -xzf "$archive"
+./qso-sidecar --no-rbn
+```
+
+On Linux x64, use the musl archive and `sha256sum`:
+
+```bash
+version=0.1.0
+archive="qso-sidecar-v${version}-x86_64-unknown-linux-musl.tar.gz"
+base="https://github.com/rwjblue/qso-sidecar/releases/download/v${version}"
+curl -LO "$base/$archive" -LO "$base/SHA256SUMS.txt"
+grep "  $archive$" SHA256SUMS.txt | sha256sum -c -
+tar -xzf "$archive"
+./qso-sidecar --no-rbn
+```
+
+Then open <http://127.0.0.1:7878>. Releases are intentionally not code-signed or
+notarized, so Windows SmartScreen and macOS Gatekeeper may warn on first launch. Verify
+the SHA-256 checksum before using **More info → Run anyway** on Windows or
+**Control-click → Open** on macOS. See Microsoft's
+[SmartScreen guidance](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation)
+and Apple's [Gatekeeper guidance](https://support.apple.com/en-us/102445).
+
+To upgrade, stop Sidecar and replace the extracted binary. The per-user LoFi identity,
+credentials, and last-good log snapshot remain in the OS application-data directory.
+
 ## Quick start
 
 Install [mise](https://mise.jdx.dev/); it installs the stable Rust toolchain configured

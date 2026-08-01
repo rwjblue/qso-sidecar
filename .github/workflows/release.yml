@@ -1,0 +1,175 @@
+name: Release binaries
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: stable
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install current stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup component add rustfmt clippy
+          rustc -Vv
+      - name: Validate tag and Cargo version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+
+          with open("Cargo.toml", "rb") as stream:
+              version = tomllib.load(stream)["package"]["version"]
+          if os.environ["EVENT_NAME"] == "push":
+              tag = os.environ["REF_NAME"]
+              if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", tag):
+                  raise SystemExit(f"release tag is not semantic version: {tag}")
+              if tag != f"v{version}":
+                  raise SystemExit(f"tag {tag} does not match Cargo version v{version}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"version={version}\n")
+          PY
+      - name: Verify current-stable policy and package contents
+        run: |
+          cargo fmt --all --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-features
+          cargo metadata --locked --no-deps --format-version 1 >/dev/null
+          cargo package --locked --list >package-actual.txt
+          diff -u package-contents.txt package-actual.txt
+
+  build:
+    needs: validate
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install current stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add "${{ matrix.target }}"
+          rustc -Vv
+      - name: Install musl build tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - name: Test and build native artifact
+        run: |
+          cargo test --locked --all-features
+          cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Package and smoke-test Unix artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          archive="qso-sidecar-v${VERSION}-${TARGET}.tar.gz"
+          stage="${RUNNER_TEMP}/qso-sidecar-package"
+          extracted="${RUNNER_TEMP}/qso-sidecar-extracted"
+          mkdir -p "$stage" "$extracted" dist
+          "target/${TARGET}/release/qso-sidecar" --version
+          "target/${TARGET}/release/qso-sidecar" --help >/dev/null
+          cp "target/${TARGET}/release/qso-sidecar" README.md LICENSE "$stage/"
+          tar -C "$stage" -czf "dist/${archive}" qso-sidecar README.md LICENSE
+          tar -C "$extracted" -xzf "dist/${archive}"
+          scripts/release-smoke.sh "$extracted/qso-sidecar" 18788 "$VERSION"
+          test "$(find "$extracted" -maxdepth 1 -type f | wc -l | tr -d ' ')" = 3
+      - name: Package and smoke-test Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $archive = "qso-sidecar-v$env:VERSION-$env:TARGET.zip"
+          $stage = Join-Path $env:RUNNER_TEMP "qso-sidecar-package"
+          $extracted = Join-Path $env:RUNNER_TEMP "qso-sidecar-extracted"
+          New-Item -ItemType Directory -Force -Path $stage, $extracted, "dist" | Out-Null
+          & "target/$env:TARGET/release/qso-sidecar.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "build-output --version failed" }
+          & "target/$env:TARGET/release/qso-sidecar.exe" --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "build-output --help failed" }
+          Copy-Item "target/$env:TARGET/release/qso-sidecar.exe", "README.md", "LICENSE" -Destination $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/$archive"
+          Expand-Archive -Path "dist/$archive" -DestinationPath $extracted
+          & ./scripts/release-smoke.ps1 -Binary "$extracted/qso-sidecar.exe" -Port 18788 -ExpectedVersion $env:VERSION
+          if ((Get-ChildItem -File $extracted).Count -ne 3) { throw "Archive has unexpected contents" }
+      - name: Upload release archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/qso-sidecar-*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all native archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: release-assets
+        run: sha256sum qso-sidecar-* >SHA256SUMS.txt
+      - name: Upload dry-run checksum artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-checksums
+          path: release-assets/SHA256SUMS.txt
+          archive: false
+          retention-days: 14
+      - name: Create or update the GitHub Release
+        if: github.event_name == 'push'
+        working-directory: release-assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --verify-tag --generate-notes --title "$TAG"
+          fi
+          gh release upload "$TAG" qso-sidecar-* SHA256SUMS.txt --clobber
+          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" == true ]]; then
+            gh release edit "$TAG" --draft=false --latest
+          fi
