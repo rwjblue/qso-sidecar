@@ -62,7 +62,8 @@ an exchange fallback. Re-importing a growing snapshot is idempotent.
 
 ## Live CW spots and entry category
 
-By default Sidecar connects to `telnet.reversebeacon.net:7000`. Set the login callsign:
+By default Sidecar connects to `telnet.reversebeacon.net:7000`, so a login callsign is
+required:
 
 ```bash
 QSO_SIDECAR_CALL=N1RWJ mise run start
@@ -84,7 +85,7 @@ CLI flags also have environment-variable equivalents:
 | --- | --- | --- |
 | `--port` | `QSO_SIDECAR_PORT` | `7878` |
 | `--cluster` | `QSO_SIDECAR_CLUSTER` | `telnet.reversebeacon.net:7000` |
-| `--call` | `QSO_SIDECAR_CALL` | unset |
+| `--call` | `QSO_SIDECAR_CALL` | required unless `--no-rbn` |
 | `--no-rbn` | `QSO_SIDECAR_NO_RBN` | false |
 | `--demo` | `QSO_SIDECAR_DEMO` | false |
 | `--lofi-base` | `QSO_SIDECAR_LOFI_BASE` | `https://lofi.ham2k.net` |

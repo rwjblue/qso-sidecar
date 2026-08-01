@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use axum::extract::{DefaultBodyLimit, Multipart, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -44,7 +44,7 @@ struct Args {
         env = "QSO_SIDECAR_CLUSTER"
     )]
     cluster: String,
-    /// Callsign sent to the DX-cluster login prompt.
+    /// Callsign sent to the DX-cluster login prompt. Required unless RBN is disabled.
     #[arg(long, env = "QSO_SIDECAR_CALL")]
     call: Option<String>,
     /// Disable the live cluster connection (and remain Single Operator eligible).
@@ -57,6 +57,14 @@ struct Args {
         env = "QSO_SIDECAR_LOFI_BASE"
     )]
     lofi_base: String,
+}
+
+fn validate_rbn_config(no_rbn: bool, call: Option<&str>) -> Result<()> {
+    ensure!(
+        no_rbn || call.is_some_and(|call| !call.trim().is_empty()),
+        "a login callsign is required when RBN is enabled; pass --call <CALL> or disable RBN with --no-rbn"
+    );
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -167,6 +175,7 @@ async fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
+    validate_rbn_config(args.no_rbn, args.call.as_deref())?;
     let lofi = lofi::LofiClient::new(args.lofi_base)?;
     let (updates, _) = broadcast::channel(32);
     let runtime = if args.demo {
@@ -732,6 +741,19 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rbn_requires_a_login_callsign() {
+        let error = validate_rbn_config(false, None).unwrap_err();
+        assert!(error.to_string().contains("login callsign is required"));
+        assert!(validate_rbn_config(false, Some("N1RWJ")).is_ok());
+        assert!(validate_rbn_config(false, Some("   ")).is_err());
+    }
+
+    #[test]
+    fn disabled_rbn_does_not_require_a_login_callsign() {
+        assert!(validate_rbn_config(true, None).is_ok());
+    }
 
     #[test]
     fn disconnect_marks_existing_candidates_stale() {
