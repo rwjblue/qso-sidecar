@@ -1,15 +1,18 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Datelike, NaiveTime, TimeZone, Utc};
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::model::Band;
+
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RawSpot {
@@ -69,7 +72,15 @@ pub async fn run(address: String, login_call: Option<String>, tx: mpsc::Sender<C
                 message: format!("connecting to {address}"),
             })
             .await;
-        match connection(&address, login_call.as_deref(), &tx, &mut connected).await {
+        match connection(
+            &address,
+            login_call.as_deref(),
+            &tx,
+            &mut connected,
+            LOGIN_TIMEOUT,
+        )
+        .await
+        {
             Ok(()) => warn!(%address, "cluster connection ended"),
             Err(error) => warn!(%address, %error, "cluster connection failed"),
         }
@@ -130,6 +141,7 @@ async fn connection(
     login_call: Option<&str>,
     tx: &mpsc::Sender<ClusterEvent>,
     connected: &mut bool,
+    login_timeout: Duration,
 ) -> Result<()> {
     let stream = TcpStream::connect(address)
         .await
@@ -139,19 +151,40 @@ async fn connection(
         write.write_all(call.as_bytes()).await?;
         write.write_all(b"\r\n").await?;
     }
-    *connected = true;
-    tx.send(ClusterEvent::Status {
-        state: ConnectionState::Connected,
-        message: "connected; live RBN spots enabled".into(),
-    })
-    .await
-    .ok();
-    info!(%address, "cluster connected");
-
     let source = RbnSpotSource;
     let mut lines = BufReader::new(read).lines();
-    while let Some(line) = lines.next_line().await? {
-        if let Some(spot) = source.parse(&line, Utc::now()) {
+    let login_deadline = Instant::now() + login_timeout;
+    loop {
+        let next_line = if *connected {
+            lines.next_line().await?
+        } else {
+            tokio::time::timeout_at(login_deadline, lines.next_line())
+                .await
+                .map_err(|_| anyhow!("cluster login timed out after {login_timeout:?}"))??
+        };
+        let Some(line) = next_line else {
+            if !*connected {
+                bail!("cluster disconnected before login was acknowledged");
+            }
+            return Ok(());
+        };
+        let spot = source.parse(&line, Utc::now());
+        if !*connected {
+            if login_rejected(&line) {
+                bail!("cluster rejected the login");
+            }
+            if spot.is_some() || login_acknowledged(&line, login_call) {
+                *connected = true;
+                tx.send(ClusterEvent::Status {
+                    state: ConnectionState::Connected,
+                    message: "connected; live RBN spots enabled".into(),
+                })
+                .await
+                .ok();
+                info!(%address, "cluster login established");
+            }
+        }
+        if let Some(spot) = spot {
             if tx.send(ClusterEvent::Spot(spot)).await.is_err() {
                 return Ok(());
             }
@@ -170,7 +203,26 @@ async fn connection(
             debug!(raw_line = %safe_line, "ignored non-CW or malformed cluster line");
         }
     }
-    Ok(())
+}
+
+fn login_acknowledged(line: &str, login_call: Option<&str>) -> bool {
+    let normalized = line.to_ascii_lowercase();
+    let positive = normalized.contains("welcome") || normalized.contains("hello");
+    positive
+        && login_call.is_some_and(|call| normalized.contains(&call.trim().to_ascii_lowercase()))
+}
+
+fn login_rejected(line: &str) -> bool {
+    let normalized = line.to_ascii_lowercase();
+    [
+        "invalid call",
+        "invalid login",
+        "login failed",
+        "login rejected",
+        "access denied",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 pub fn parse_line(line: &str, now: DateTime<Utc>) -> Option<RawSpot> {
@@ -254,6 +306,10 @@ use chrono::Timelike;
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
     use chrono::TimeZone;
 
     use super::*;
@@ -329,5 +385,174 @@ mod tests {
             assert!(delay >= Duration::from_secs(8));
             assert!(delay <= Duration::from_secs(12));
         }
+    }
+
+    async fn read_login(stream: &mut TcpStream) -> Vec<u8> {
+        let mut login = Vec::new();
+        loop {
+            let byte = stream.read_u8().await.unwrap();
+            login.push(byte);
+            if login.ends_with(b"\r\n") {
+                return login;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_handshake_sends_crlf_and_streams_multiple_spots() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (login_tx, login_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(b"Welcome banner\r\nlogin: ")
+                .await
+                .unwrap();
+            login_tx.send(read_login(&mut stream).await).ok();
+            stream
+                .write_all(
+                    b"Hello N1RWJ, welcome to the cluster\r\n\
+                      DX de WZ7I-#: 14025.1 K1ABC 17 dB 26 WPM CQ 1823Z\r\n\
+                      DX de VE6JY-#: 7032.4 W2XYZ 12 dB 22 WPM CQ 1824Z\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut connected = false;
+
+        connection(
+            &address.to_string(),
+            Some("N1RWJ"),
+            &tx,
+            &mut connected,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(login_rx.await.unwrap(), b"N1RWJ\r\n");
+        assert!(connected);
+        drop(tx);
+        let mut connected_events = 0;
+        let mut spots = Vec::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                ClusterEvent::Status {
+                    state: ConnectionState::Connected,
+                    ..
+                } => connected_events += 1,
+                ClusterEvent::Spot(spot) => spots.push(spot.call),
+                ClusterEvent::Status { .. } => {}
+            }
+        }
+        assert_eq!(connected_events, 1);
+        assert_eq!(spots, ["K1ABC", "W2XYZ"]);
+    }
+
+    #[tokio::test]
+    async fn first_valid_spot_establishes_login_without_a_banner() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(read_login(&mut stream).await, b"N1RWJ\r\n");
+            stream
+                .write_all(b"DX de WZ7I-#: 14025.1 K1ABC 17 dB 26 WPM CQ 1823Z\r\n")
+                .await
+                .unwrap();
+        });
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut connected = false;
+
+        connection(
+            &address.to_string(),
+            Some("N1RWJ"),
+            &tx,
+            &mut connected,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert!(connected);
+        assert!(matches!(
+            rx.recv().await,
+            Some(ClusterEvent::Status {
+                state: ConnectionState::Connected,
+                ..
+            })
+        ));
+        assert!(matches!(rx.recv().await, Some(ClusterEvent::Spot(_))));
+    }
+
+    #[tokio::test]
+    async fn stalled_login_times_out_without_claiming_a_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(read_login(&mut stream).await, b"N1RWJ\r\n");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut connected = false;
+
+        let error = connection(
+            &address.to_string(),
+            Some("N1RWJ"),
+            &tx,
+            &mut connected,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+
+        assert!(error.to_string().contains("login timed out"));
+        assert!(!connected);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_login_reconnects_and_can_become_live() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            assert_eq!(read_login(&mut first).await, b"N1RWJ\r\n");
+            first.write_all(b"Login rejected\r\n").await.unwrap();
+            drop(first);
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            assert_eq!(read_login(&mut second).await, b"N1RWJ\r\n");
+            second
+                .write_all(b"Hello N1RWJ, welcome to the cluster\r\n")
+                .await
+                .unwrap();
+        });
+        let (tx, mut rx) = mpsc::channel(16);
+        let client = tokio::spawn(run(address.to_string(), Some("N1RWJ".into()), tx));
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if matches!(
+                    rx.recv().await,
+                    Some(ClusterEvent::Status {
+                        state: ConnectionState::Connected,
+                        ..
+                    })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("client did not reconnect and establish a live session");
+        client.abort();
+        server.await.unwrap();
     }
 }

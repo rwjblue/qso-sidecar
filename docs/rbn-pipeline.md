@@ -14,9 +14,26 @@ best SNR, total reports, and the distinct reporting skimmers. Disconnects keep t
 last-known candidates but mark them stale until each one is observed again.
 
 Reconnect delay uses capped exponential backoff with per-process ±20% jitter. The
-backoff resets after an established connection. Timing, expiry, aggregation,
+dashboard does not report a live connection merely because the TCP socket opened: it
+waits for a positive login acknowledgement containing the configured callsign or the
+first valid spot. A stalled login times out after 15 seconds, and rejected or dropped
+sessions reconnect normally. The backoff resets after an established connection. Timing, expiry, aggregation,
 classification, malformed input, and representative high-volume behavior are covered
 by deterministic tests.
+
+## Optional live smoke test
+
+Automated tests use only a local fake cluster. To manually verify the public endpoint,
+start Sidecar outside an active unassisted entry with a valid callsign:
+
+```bash
+QSO_SIDECAR_CALL=N1RWJ mise run start -- --rbn
+```
+
+Open the dashboard and confirm that the RBN status progresses from connecting to live
+only after the server acknowledges the login or emits a valid CQ spot. Stop Sidecar,
+repeat once to exercise a fresh session, and do not attach captured live output to bug
+reports because it may include operator callsigns.
 
 ## Exchange inference policy
 
