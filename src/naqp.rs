@@ -1,26 +1,40 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
-use chrono::{Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::Serialize;
 
 use crate::model::{Band, Qso};
+use crate::naqp_catalog::{self, MultiplierGroup};
 
-const US_MULTIPLIERS: &[&str] = &[
-    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS",
-    "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY",
-    "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV",
-    "WI", "WY", "DC",
-];
-const CANADIAN_MULTIPLIERS: &[&str] = &[
-    "AB", "BC", "MB", "NB", "NL", "NS", "NT", "NU", "ON", "PE", "QC", "SK", "YT",
-];
-// Exchange abbreviations accepted by the NAQP rules for other North American entities.
-const NA_ENTITY_MULTIPLIERS: &[&str] = &[
-    "4U1U", "6Y", "8P", "C6", "CM", "CY9", "CY0", "FG", "FJ", "FM", "FO", "FP", "FS", "HH", "HI",
-    "HK0", "HP", "HR", "J3", "J6", "J7", "J8", "KG4", "KP1", "KP2", "KP4", "KP5", "OX", "PJ5",
-    "PJ7", "TG", "TI", "TI9", "V2", "V3", "V4", "VP2E", "VP2M", "VP2V", "VP5", "VP9", "XE", "XF4",
-    "YN", "YS", "YV0", "ZF",
-];
+pub const RULES_VERSION: &str = "2026-08-cw";
+pub const OFFICIAL_RULES_URL: &str = "https://ncjweb.com/NAQP-Rules.pdf";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ContestRules {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub version: &'static str,
+    pub official_source: &'static str,
+    pub mode: &'static str,
+    pub starts_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+    pub maximum_operating_minutes: i64,
+    pub bands: [Band; 6],
+}
+
+pub fn contest_rules() -> ContestRules {
+    ContestRules {
+        id: "naqp-cw-2026-08",
+        name: "NAQP CW — August 2026",
+        version: RULES_VERSION,
+        official_source: OFFICIAL_RULES_URL,
+        mode: "CW",
+        starts_at: Utc.with_ymd_and_hms(2026, 8, 1, 18, 0, 0).unwrap(),
+        ends_at: Utc.with_ymd_and_hms(2026, 8, 2, 6, 0, 0).unwrap(),
+        maximum_operating_minutes: 600,
+        bands: Band::ALL,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct BandScore {
@@ -33,22 +47,58 @@ pub struct BandScore {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ScoredQso {
     pub id: String,
+    pub band: Option<Band>,
+    pub status: QsoStatus,
+    pub reason: QsoReason,
     pub duplicate: bool,
     pub unresolved_exchange: bool,
     pub multiplier: Option<String>,
+    pub multiplier_id: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QsoStatus {
+    Valid,
+    Duplicate,
+    Unresolved,
+    Excluded,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QsoReason {
+    Credited,
+    DuplicateCallOnBand,
+    IncompleteExchange,
+    WrongMode,
+    IneligibleBand,
+    OutsideContestPeriod,
+    Tombstone,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MultiplierRow {
+    pub id: &'static str,
+    pub code: &'static str,
+    pub display_name: &'static str,
+    pub group: MultiplierGroup,
+    pub worked_bands: BTreeSet<Band>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Score {
+    pub rules_version: &'static str,
     pub valid_qsos: usize,
     pub duplicates: usize,
     pub unresolved_exchanges: usize,
+    pub excluded_qsos: usize,
     pub total_multipliers: usize,
     pub claimed_score: usize,
     pub operating_minutes: i64,
     pub off_minutes: i64,
     pub bands: Vec<BandScore>,
-    pub multiplier_rows: BTreeMap<String, BTreeSet<Band>>,
+    pub multiplier_rows: Vec<MultiplierRow>,
     pub qsos: Vec<ScoredQso>,
 }
 
@@ -64,27 +114,24 @@ pub fn normalize_multiplier(value: &str) -> Option<String> {
         "4U1UN" | "4U1/U" => "4U1U".into(),
         other => other.into(),
     };
-    US_MULTIPLIERS
-        .iter()
-        .chain(CANADIAN_MULTIPLIERS)
-        .chain(NA_ENTITY_MULTIPLIERS)
-        .any(|candidate| *candidate == token)
-        .then_some(token)
+    naqp_catalog::find(&token).map(|multiplier| multiplier.code.to_string())
+}
+
+pub fn resolve_qso_multiplier(qso: &Qso) -> Option<&'static naqp_catalog::MultiplierDefinition> {
+    let code = qso
+        .location
+        .as_deref()
+        .and_then(|location| location.split_whitespace().last())
+        .and_then(normalize_multiplier)?;
+    naqp_catalog::resolve(&code, &qso.call, qso.country.as_deref())
 }
 
 pub fn score(qsos: impl IntoIterator<Item = Qso>) -> Score {
-    let mut input: Vec<_> = qsos
-        .into_iter()
-        .filter(|qso| {
-            let start = Utc.with_ymd_and_hms(2026, 8, 1, 18, 0, 0).unwrap();
-            let end = Utc.with_ymd_and_hms(2026, 8, 2, 6, 0, 0).unwrap();
-            !qso.deleted
-                && qso.band.is_some()
-                && qso.mode.eq_ignore_ascii_case("CW")
-                && qso.timestamp >= start
-                && qso.timestamp < end
-        })
-        .collect();
+    score_with_rules(qsos, &contest_rules())
+}
+
+pub fn score_with_rules(qsos: impl IntoIterator<Item = Qso>, rules: &ContestRules) -> Score {
+    let mut input: Vec<_> = qsos.into_iter().collect();
     input.sort_by_key(|qso| qso.timestamp);
 
     let mut seen = HashSet::new();
@@ -94,15 +141,15 @@ pub fn score(qsos: impl IntoIterator<Item = Qso>) -> Score {
     let mut valid_timestamps = Vec::new();
     let mut duplicate_count = 0;
     let mut unresolved_count = 0;
+    let mut excluded_count = 0;
 
     for qso in input {
-        let band = qso.band.expect("filtered to eligible bands");
-        let key = (qso.normalized_call(), band);
         let multiplier = qso
             .location
             .as_deref()
             .and_then(|location| location.split_whitespace().last())
             .and_then(normalize_multiplier);
+        let multiplier_definition = resolve_qso_multiplier(&qso);
         let explicit_non_na = qso
             .location
             .as_deref()
@@ -112,26 +159,65 @@ pub fn score(qsos: impl IntoIterator<Item = Qso>) -> Score {
             .name
             .as_deref()
             .is_some_and(|name| !name.trim().is_empty());
-        let unresolved = !has_name || (multiplier.is_none() && !explicit_non_na);
         let complete_exchange = has_name && (multiplier.is_some() || explicit_non_na);
-        let duplicate = complete_exchange && !seen.insert(key);
-
-        if !complete_exchange {
+        let (status, reason, duplicate, unresolved) = if qso.deleted {
+            excluded_count += 1;
+            (QsoStatus::Excluded, QsoReason::Tombstone, false, false)
+        } else if !qso.mode.eq_ignore_ascii_case(rules.mode) {
+            excluded_count += 1;
+            (QsoStatus::Excluded, QsoReason::WrongMode, false, false)
+        } else if qso.band.is_none() {
+            excluded_count += 1;
+            (QsoStatus::Excluded, QsoReason::IneligibleBand, false, false)
+        } else if qso.timestamp < rules.starts_at || qso.timestamp >= rules.ends_at {
+            excluded_count += 1;
+            (
+                QsoStatus::Excluded,
+                QsoReason::OutsideContestPeriod,
+                false,
+                false,
+            )
+        } else if !complete_exchange {
             unresolved_count += 1;
-        } else if duplicate {
-            duplicate_count += 1;
-        } else {
-            *counts.entry(band).or_default() += 1;
-            valid_timestamps.push(qso.timestamp);
-            if let Some(value) = &multiplier {
-                multipliers.entry(band).or_default().insert(value.clone());
+            (
+                QsoStatus::Unresolved,
+                QsoReason::IncompleteExchange,
+                false,
+                true,
+            )
+        } else if let Some(band) = qso.band {
+            let key = (qso.normalized_call(), band);
+            if !seen.insert(key) {
+                duplicate_count += 1;
+                (
+                    QsoStatus::Duplicate,
+                    QsoReason::DuplicateCallOnBand,
+                    true,
+                    false,
+                )
+            } else {
+                *counts.entry(band).or_default() += 1;
+                valid_timestamps.push(qso.timestamp);
+                if let Some(definition) = multiplier_definition {
+                    multipliers
+                        .entry(band)
+                        .or_default()
+                        .insert(definition.id.to_string());
+                }
+                (QsoStatus::Valid, QsoReason::Credited, false, false)
             }
-        }
+        } else {
+            unreachable!("missing bands are excluded above")
+        };
         scored.push(ScoredQso {
             id: qso.id,
+            band: qso.band,
+            status,
+            reason,
             duplicate,
             unresolved_exchange: unresolved,
             multiplier,
+            multiplier_id: multiplier_definition.map(|definition| definition.id),
         });
     }
 
@@ -150,17 +236,30 @@ pub fn score(qsos: impl IntoIterator<Item = Qso>) -> Score {
                 .unwrap_or_default(),
         })
         .collect();
-    let mut multiplier_rows: BTreeMap<String, BTreeSet<Band>> = BTreeMap::new();
-    for (band, values) in multipliers {
-        for value in values {
-            multiplier_rows.entry(value).or_default().insert(band);
-        }
-    }
+    let multiplier_rows = naqp_catalog::MULTIPLIERS
+        .iter()
+        .map(|definition| MultiplierRow {
+            id: definition.id,
+            code: definition.code,
+            display_name: definition.display_name,
+            group: definition.group,
+            worked_bands: Band::ALL
+                .into_iter()
+                .filter(|band| {
+                    multipliers
+                        .get(band)
+                        .is_some_and(|values| values.contains(definition.id))
+                })
+                .collect(),
+        })
+        .collect();
 
     Score {
+        rules_version: rules.version,
         valid_qsos,
         duplicates: duplicate_count,
         unresolved_exchanges: unresolved_count,
+        excluded_qsos: excluded_count,
         total_multipliers,
         claimed_score: valid_qsos * total_multipliers,
         operating_minutes,
@@ -233,7 +332,13 @@ mod tests {
             qso("2", "K1ABC", Band::B40, 1, "CT"),
         ]);
         assert_eq!(result.total_multipliers, 2);
-        assert_eq!(result.multiplier_rows["CT"].len(), 2);
+        let ct = result
+            .multiplier_rows
+            .iter()
+            .find(|row| row.code == "CT")
+            .unwrap();
+        assert_eq!(ct.worked_bands.len(), 2);
+        assert_eq!(result.multiplier_rows.len(), 111);
     }
 
     #[test]
@@ -288,6 +393,77 @@ mod tests {
         wrong_mode.mode = "SSB".into();
         let mut late = qso("2", "K1ABC", Band::B20, 1, "MA");
         late.timestamp = Utc.with_ymd_and_hms(2026, 8, 2, 6, 0, 0).unwrap();
-        assert_eq!(score([wrong_mode, late]).valid_qsos, 0);
+        let result = score([wrong_mode, late]);
+        assert_eq!(result.valid_qsos, 0);
+        assert_eq!(result.excluded_qsos, 2);
+        assert_eq!(result.qsos.len(), 2);
+        assert_eq!(result.qsos[0].reason, QsoReason::WrongMode);
+        assert_eq!(result.qsos[1].reason, QsoReason::OutsideContestPeriod);
+    }
+
+    #[test]
+    fn every_normalized_record_has_an_explicit_status_and_reason() {
+        let valid = qso("valid", "W1AW", Band::B20, 0, "CT");
+        let duplicate = qso("duplicate", "W1AW", Band::B20, 1, "CT");
+        let mut unknown_band = qso("band", "K1ABC", Band::B20, 2, "MA");
+        unknown_band.band = None;
+        let mut tombstone = qso("deleted", "K2ABC", Band::B20, 3, "NY");
+        tombstone.deleted = true;
+
+        let result = score([valid, duplicate, unknown_band, tombstone]);
+
+        assert_eq!(result.qsos[0].status, QsoStatus::Valid);
+        assert_eq!(result.qsos[0].reason, QsoReason::Credited);
+        assert_eq!(result.qsos[1].status, QsoStatus::Duplicate);
+        assert_eq!(result.qsos[1].reason, QsoReason::DuplicateCallOnBand);
+        assert_eq!(result.qsos[2].reason, QsoReason::IneligibleBand);
+        assert_eq!(result.qsos[3].reason, QsoReason::Tombstone);
+    }
+
+    #[test]
+    fn hand_calculated_fixture_covers_all_bands_and_multiplier_groups() {
+        let result = score([
+            qso("1", "W1AW", Band::B160, 0, "CT"),
+            qso("2", "VE3EJ", Band::B80, 1, "ON"),
+            qso("3", "KP2M", Band::B40, 2, "KP2"),
+            qso("4", "K1ABC", Band::B20, 3, "MA"),
+            qso("5", "VE2ABC", Band::B15, 4, "QC"),
+            qso("6", "ZF1A", Band::B10, 5, "ZF"),
+        ]);
+
+        assert_eq!(result.valid_qsos, 6);
+        assert_eq!(result.total_multipliers, 6);
+        assert_eq!(result.claimed_score, 36);
+        assert!(result.bands.iter().all(|band| band.qsos == 1));
+    }
+
+    #[test]
+    fn hawaii_and_dominican_republic_are_distinct_hi_multipliers() {
+        let mut hawaii = qso("1", "KH6ABC", Band::B20, 0, "HI");
+        hawaii.country = Some("Hawaii".into());
+        let mut dominican = qso("2", "HI8ABC", Band::B20, 1, "HI");
+        dominican.country = Some("Dominican Republic".into());
+
+        let result = score([hawaii, dominican]);
+
+        assert_eq!(result.total_multipliers, 2);
+        assert!(
+            result
+                .multiplier_rows
+                .iter()
+                .find(|row| row.id == "US-HI")
+                .unwrap()
+                .worked_bands
+                .contains(&Band::B20)
+        );
+        assert!(
+            result
+                .multiplier_rows
+                .iter()
+                .find(|row| row.id == "DXCC-HI")
+                .unwrap()
+                .worked_bands
+                .contains(&Band::B20)
+        );
     }
 }

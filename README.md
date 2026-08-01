@@ -27,6 +27,15 @@ Open <http://127.0.0.1:7878>. To exercise the entire UI without showing a real l
 mise run start -- --demo --no-rbn
 ```
 
+Failure-state demos are also built in. For example:
+
+```bash
+mise run start -- --demo --no-rbn --demo-scenario unresolved-exchange
+```
+
+Available scenarios are `normal`, `no-log`, `stale-adif`, `lofi-unavailable`,
+`rbn-disconnected`, `malformed-import`, and `unresolved-exchange`.
+
 Development and verification tasks:
 
 ```bash
@@ -99,6 +108,7 @@ CLI flags also have environment-variable equivalents:
 | `--spot-dedupe-khz` | `QSO_SIDECAR_SPOT_DEDUPE_KHZ` | `1.0` |
 | `--spot-capacity` | `QSO_SIDECAR_SPOT_CAPACITY` | `200` |
 | `--demo` | `QSO_SIDECAR_DEMO` | false |
+| `--demo-scenario` | `QSO_SIDECAR_DEMO_SCENARIO` | `normal` |
 | `--lofi-base` | `QSO_SIDECAR_LOFI_BASE` | `https://lofi.ham2k.net` |
 
 The HTTP listener always binds to `127.0.0.1`. Use `RUST_LOG=qso_sidecar=debug` for
@@ -115,6 +125,9 @@ contacts from 18:00 UTC August 1 through 05:59:59 UTC August 2, eligible
 duplicate/unresolved tracking, and claimed score = valid QSOs × per-band multipliers.
 Estimated off time uses the required 31-minute consecutive-QSO timestamp boundary.
 Adjudication penalties are outside this claimed-score companion.
+
+The versioned rules assumptions, complete multiplier catalog, and diagnostic behavior
+are documented in [`docs/naqp-rules.md`](docs/naqp-rules.md).
 
 ## License
 

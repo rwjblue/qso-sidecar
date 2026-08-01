@@ -133,3 +133,19 @@ pub struct Operation {
     pub end: Option<DateTime<Utc>>,
     pub is_naqp: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecordDiagnostic {
+    pub id: Option<String>,
+    pub reason: RecordReason,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordReason {
+    EventOrNonContact,
+    MissingCall,
+    MissingTimestamp,
+    MalformedRecord,
+}

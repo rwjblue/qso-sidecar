@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::log_source::LogUpdate;
-use crate::model::{Band, Qso};
+use crate::model::{Band, Qso, RecordDiagnostic, RecordReason};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImportDiagnostics {
@@ -18,6 +18,8 @@ pub struct ImportDiagnostics {
     pub unchanged: usize,
     pub skipped: usize,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub record_diagnostics: Vec<RecordDiagnostic>,
 }
 
 pub fn import_snapshot(
@@ -36,6 +38,11 @@ pub fn import_snapshot(
             Ok(qso) => qsos.push(qso),
             Err(error) => {
                 diagnostics.skipped += 1;
+                diagnostics.record_diagnostics.push(RecordDiagnostic {
+                    id: Some(format!("adif-record-{}", index + 1)),
+                    reason: RecordReason::MalformedRecord,
+                    detail: format!("{error:#}"),
+                });
                 if diagnostics.warnings.len() < 20 {
                     diagnostics
                         .warnings

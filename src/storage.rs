@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::adif::ImportDiagnostics;
 use crate::log_source::LogSourceKind;
-use crate::model::Qso;
+use crate::model::{Qso, RecordDiagnostic};
 
 const STATE_VERSION: u8 = 1;
 
@@ -24,6 +24,8 @@ pub struct PersistedState {
     pub source: String,
     pub source_freshness: Option<DateTime<Utc>>,
     pub import_diagnostics: ImportDiagnostics,
+    #[serde(default)]
+    pub source_diagnostics: Vec<RecordDiagnostic>,
 }
 
 impl PersistedState {
@@ -34,6 +36,7 @@ impl PersistedState {
         source: String,
         source_freshness: Option<DateTime<Utc>>,
         import_diagnostics: ImportDiagnostics,
+        source_diagnostics: Vec<RecordDiagnostic>,
     ) -> Self {
         Self {
             version: STATE_VERSION,
@@ -43,6 +46,7 @@ impl PersistedState {
             source,
             source_freshness,
             import_diagnostics,
+            source_diagnostics,
         }
     }
 }
@@ -143,6 +147,7 @@ mod tests {
             source.into(),
             Some(Utc::now()),
             ImportDiagnostics::default(),
+            Vec::new(),
         )
     }
 

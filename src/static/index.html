@@ -6,6 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>QSO Sidecar — NAQP CW</title>
   <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/responsive.css">
 </head>
 <body>
   <a class="skip" href="#main">Skip to dashboard</a>
@@ -31,7 +32,10 @@
           <div id="bands" class="bands"></div>
         </section>
         <section class="panel matrix-panel">
-          <div class="panel-head"><div><p class="eyebrow">WORKED MULTIPLIERS</p><h2>Multiplier matrix</h2></div><span class="legend">✓ worked · <span aria-hidden="true">·</span> needed</span></div>
+          <div class="panel-head"><div><p class="eyebrow">ALL 111 MULTIPLIERS</p><h2>Multiplier matrix</h2></div><span class="legend">✓ worked · V verified · ? possible · ! unresolved · · needed</span></div>
+          <div id="matrix-filters" class="filters matrix-filters" role="group" aria-label="Multiplier groups">
+            <button data-group="all" class="active" aria-pressed="true">All</button><button data-group="us_dc" aria-pressed="false">US/DC</button><button data-group="canada" aria-pressed="false">Canada</button><button data-group="other_north_america" aria-pressed="false">Other NA</button>
+          </div>
           <div class="table-wrap"><table id="matrix"><thead><tr><th scope="col">MULT</th><th>160</th><th>80</th><th>40</th><th>20</th><th>15</th><th>10</th></tr></thead><tbody></tbody></table></div>
         </section>
       </div>

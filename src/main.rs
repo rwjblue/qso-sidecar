@@ -3,6 +3,7 @@ mod lofi;
 mod log_source;
 mod model;
 mod naqp;
+mod naqp_catalog;
 mod rbn;
 mod storage;
 
@@ -19,7 +20,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, TimeZone, Utc};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures_util::Stream;
 use model::{Band, Operation, Qso, Spot, SpotClass};
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,14 @@ struct Args {
     /// Serve synthetic contest data; no real log data is exposed in the dashboard.
     #[arg(long, env = "QSO_SIDECAR_DEMO")]
     demo: bool,
+    /// Synthetic state to load with --demo.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = DemoScenario::Normal,
+        env = "QSO_SIDECAR_DEMO_SCENARIO"
+    )]
+    demo_scenario: DemoScenario,
     /// Loopback HTTP port.
     #[arg(long, default_value_t = 7878, env = "QSO_SIDECAR_PORT")]
     port: u16,
@@ -71,6 +80,18 @@ struct Args {
         env = "QSO_SIDECAR_LOFI_BASE"
     )]
     lofi_base: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum DemoScenario {
+    #[default]
+    Normal,
+    NoLog,
+    StaleAdif,
+    LofiUnavailable,
+    RbnDisconnected,
+    MalformedImport,
+    UnresolvedExchange,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -147,6 +168,7 @@ struct Runtime {
     lofi_status: String,
     lofi_account_call: Option<String>,
     import_diagnostics: adif::ImportDiagnostics,
+    source_diagnostics: Vec<model::RecordDiagnostic>,
     spot_status: String,
     spots_enabled: bool,
     spot_policy: SpotPolicy,
@@ -157,8 +179,9 @@ struct Runtime {
 struct PublicState {
     api_version: u8,
     generated_at: DateTime<Utc>,
-    contest: Contest,
+    contest: naqp::ContestRules,
     score: naqp::Score,
+    multiplier_matrix: Vec<MatrixRow>,
     spots: Vec<Spot>,
     operations: Vec<Operation>,
     selected_operation: Option<String>,
@@ -169,6 +192,7 @@ struct PublicState {
     lofi_linked: bool,
     lofi_account_call: Option<String>,
     import_diagnostics: adif::ImportDiagnostics,
+    source_diagnostics: Vec<model::RecordDiagnostic>,
     spot_status: String,
     spots_enabled: bool,
     assisted_warning: Option<&'static str>,
@@ -177,11 +201,28 @@ struct PublicState {
 }
 
 #[derive(Debug, Serialize)]
-struct Contest {
-    name: &'static str,
-    starts_at: DateTime<Utc>,
-    ends_at: DateTime<Utc>,
-    maximum_operating_minutes: i64,
+struct MatrixRow {
+    id: &'static str,
+    code: &'static str,
+    display_name: &'static str,
+    group: naqp_catalog::MultiplierGroup,
+    cells: Vec<MatrixCell>,
+}
+
+#[derive(Debug, Serialize)]
+struct MatrixCell {
+    band: Band,
+    state: MatrixCellState,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MatrixCellState {
+    Needed,
+    PossibleSpotted,
+    VerifiedSpotted,
+    Unresolved,
+    Worked,
 }
 
 impl Runtime {
@@ -207,6 +248,7 @@ impl Runtime {
                 lofi_status: "starting LoFi client registration".into(),
                 lofi_account_call: None,
                 import_diagnostics: restored.import_diagnostics,
+                source_diagnostics: restored.source_diagnostics,
                 spot_status,
                 spots_enabled,
                 spot_policy,
@@ -224,6 +266,7 @@ impl Runtime {
             lofi_status: "starting LoFi client registration".into(),
             lofi_account_call: None,
             import_diagnostics: adif::ImportDiagnostics::default(),
+            source_diagnostics: Vec::new(),
             spot_status,
             spots_enabled,
             spot_policy,
@@ -237,6 +280,7 @@ impl Runtime {
         source_kind: log_source::LogSourceKind,
         source: String,
         source_freshness: DateTime<Utc>,
+        source_diagnostics: Vec<model::RecordDiagnostic>,
     ) -> storage::PersistedState {
         storage::PersistedState::new(
             qsos,
@@ -245,12 +289,14 @@ impl Runtime {
             source,
             Some(source_freshness),
             self.import_diagnostics.clone(),
+            source_diagnostics,
         )
     }
 
     fn public(&self) -> PublicState {
         let score = naqp::score(self.qsos.values().cloned());
         let spots = self.fresh_spots(Utc::now());
+        let multiplier_matrix = build_multiplier_matrix(&score, &spots);
         let current_band = self
             .qsos
             .values()
@@ -260,13 +306,9 @@ impl Runtime {
         PublicState {
             api_version: 1,
             generated_at: Utc::now(),
-            contest: Contest {
-                name: "NAQP CW — August 2026",
-                starts_at: Utc.with_ymd_and_hms(2026, 8, 1, 18, 0, 0).unwrap(),
-                ends_at: Utc.with_ymd_and_hms(2026, 8, 2, 6, 0, 0).unwrap(),
-                maximum_operating_minutes: 600,
-            },
+            contest: naqp::contest_rules(),
             score,
+            multiplier_matrix,
             spots,
             operations: self.operations.clone(),
             selected_operation: self.selected_operation.clone(),
@@ -277,6 +319,7 @@ impl Runtime {
             lofi_linked: self.lofi_account_call.is_some(),
             lofi_account_call: self.lofi_account_call.clone(),
             import_diagnostics: self.import_diagnostics.clone(),
+            source_diagnostics: self.source_diagnostics.clone(),
             spot_status: self.spot_status.clone(),
             spots_enabled: self.spots_enabled,
             assisted_warning: self.spots_enabled.then_some(
@@ -297,6 +340,50 @@ impl Runtime {
         spots.sort_by_key(|spot| std::cmp::Reverse(spot.time));
         spots
     }
+}
+
+fn build_multiplier_matrix(score: &naqp::Score, spots: &[Spot]) -> Vec<MatrixRow> {
+    score
+        .multiplier_rows
+        .iter()
+        .map(|row| MatrixRow {
+            id: row.id,
+            code: row.code,
+            display_name: row.display_name,
+            group: row.group,
+            cells: Band::ALL
+                .into_iter()
+                .map(|band| {
+                    let state = if row.worked_bands.contains(&band) {
+                        MatrixCellState::Worked
+                    } else if score.qsos.iter().any(|qso| {
+                        qso.status == naqp::QsoStatus::Unresolved
+                            && qso.band == Some(band)
+                            && qso.multiplier_id == Some(row.id)
+                    }) {
+                        MatrixCellState::Unresolved
+                    } else if spots.iter().any(|spot| {
+                        !spot.stale
+                            && spot.band == band
+                            && spot.class == SpotClass::VerifiedMultiplier
+                            && spot.predicted_multiplier.as_deref() == Some(row.id)
+                    }) {
+                        MatrixCellState::VerifiedSpotted
+                    } else if spots.iter().any(|spot| {
+                        !spot.stale
+                            && spot.band == band
+                            && spot.class == SpotClass::PossibleMultiplier
+                            && spot.predicted_multiplier.as_deref() == Some(row.id)
+                    }) {
+                        MatrixCellState::PossibleSpotted
+                    } else {
+                        MatrixCellState::Needed
+                    };
+                    MatrixCell { band, state }
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 #[tokio::main]
@@ -321,7 +408,7 @@ async fn main() -> Result<()> {
     };
     let (updates, _) = broadcast::channel(32);
     let runtime = if args.demo {
-        demo_runtime(!args.no_rbn, spot_policy)
+        demo_runtime(!args.no_rbn, spot_policy, args.demo_scenario)
     } else {
         Runtime::normal(!args.no_rbn, spot_policy, restored)
     };
@@ -340,6 +427,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/app.css", get(styles))
+        .route("/responsive.css", get(responsive_styles))
         .route("/app.js", get(script))
         .route("/healthz", get(health))
         .route("/api/state", get(api_state))
@@ -366,6 +454,13 @@ async fn index() -> Html<&'static str> {
 
 async fn styles() -> impl IntoResponse {
     asset("text/css; charset=utf-8", include_str!("static/app.css"))
+}
+
+async fn responsive_styles() -> impl IntoResponse {
+    asset(
+        "text/css; charset=utf-8",
+        include_str!("static/responsive.css"),
+    )
 }
 
 async fn script() -> impl IntoResponse {
@@ -431,6 +526,7 @@ async fn import_adif(State(state): State<AppState>, mut multipart: Multipart) ->
                 source.clone(),
                 Some(freshness),
                 diagnostics.clone(),
+                diagnostics.record_diagnostics.clone(),
             );
             if let Err(error) = state.store.save(&persisted) {
                 return api_error(
@@ -444,6 +540,7 @@ async fn import_adif(State(state): State<AppState>, mut multipart: Multipart) ->
             }
             runtime.selected_operation = None;
             runtime.import_diagnostics = diagnostics.clone();
+            runtime.source_diagnostics = diagnostics.record_diagnostics.clone();
             runtime.source = source;
             runtime.source_kind = Some(log_source::LogSourceKind::Adif);
             runtime.source_freshness = Some(freshness);
@@ -514,7 +611,7 @@ async fn toggle_demo(State(state): State<AppState>, Json(request): Json<DemoRequ
     let spots_enabled = state.runtime.read().await.spots_enabled;
     let mut runtime = state.runtime.write().await;
     if request.enabled {
-        *runtime = demo_runtime(spots_enabled, runtime.spot_policy);
+        *runtime = demo_runtime(spots_enabled, runtime.spot_policy, DemoScenario::Normal);
     } else {
         let restored = match state.store.load() {
             Ok(restored) => restored,
@@ -594,7 +691,8 @@ async fn run_lofi_sync(state: AppState) {
             };
             let selection_changed = selected_seen.as_deref() != Some(&selected);
             let query_watermark = if selection_changed { None } else { watermark };
-            let qsos = state.lofi.qsos(&selected, query_watermark).await?;
+            let lofi::QsoBatch { qsos, diagnostics } =
+                state.lofi.qsos(&selected, query_watermark).await?;
             let next_watermark = qsos
                 .iter()
                 .filter_map(|qso| qso.raw.get("updatedAtMillis").and_then(Value::as_i64))
@@ -607,13 +705,19 @@ async fn run_lofi_sync(state: AppState) {
                     log_source::LogUpdate::lofi(qsos, selection_changed).apply(&mut next_qsos);
                 let source = "Live Ham2K LoFi sync".to_string();
                 let freshness = Utc::now();
-                let persisted =
-                    runtime.persisted(next_qsos.clone(), applied.source, source.clone(), freshness);
+                let persisted = runtime.persisted(
+                    next_qsos.clone(),
+                    applied.source,
+                    source.clone(),
+                    freshness,
+                    diagnostics.clone(),
+                );
                 state.store.save(&persisted)?;
                 runtime.qsos = next_qsos;
                 runtime.source = source;
                 runtime.source_kind = Some(applied.source);
                 runtime.source_freshness = Some(freshness);
+                runtime.source_diagnostics = diagnostics;
             }
             selected_seen = Some(selected);
             watermark = next_watermark.or(query_watermark);
@@ -736,22 +840,19 @@ fn classify_spot(runtime: &Runtime, call: &str, band: Band) -> (SpotClass, Optio
     }
     if let Some(multiplier) = matching
         .iter()
-        .filter_map(|qso| qso.location.as_deref())
-        .find_map(naqp::normalize_multiplier)
+        .find_map(|qso| naqp::resolve_qso_multiplier(qso))
     {
         let already_have = runtime.qsos.values().any(|qso| {
             qso.band == Some(band)
-                && qso
-                    .location
-                    .as_deref()
-                    .and_then(naqp::normalize_multiplier)
-                    .as_deref()
-                    == Some(&multiplier)
+                && naqp::resolve_qso_multiplier(qso).map(|value| value.id) == Some(multiplier.id)
         });
         return if already_have {
-            (SpotClass::NeededQso, Some(multiplier))
+            (SpotClass::NeededQso, Some(multiplier.id.to_string()))
         } else {
-            (SpotClass::VerifiedMultiplier, Some(multiplier))
+            (
+                SpotClass::VerifiedMultiplier,
+                Some(multiplier.id.to_string()),
+            )
         };
     }
     if matching.iter().any(|qso| qso.country.is_some()) {
@@ -760,7 +861,7 @@ fn classify_spot(runtime: &Runtime, call: &str, band: Band) -> (SpotClass, Optio
     (SpotClass::Unknown, None)
 }
 
-fn demo_runtime(spots_enabled: bool, spot_policy: SpotPolicy) -> Runtime {
+fn demo_runtime(spots_enabled: bool, spot_policy: SpotPolicy, scenario: DemoScenario) -> Runtime {
     let mut qsos = BTreeMap::new();
     let demo = [
         ("W1AW", Band::B20, 18, 3, "AL", "CT"),
@@ -808,7 +909,7 @@ fn demo_runtime(spots_enabled: bool, spot_policy: SpotPolicy) -> Runtime {
             Band::B20,
             14_038.2,
             SpotClass::PossibleMultiplier,
-            Some("NV?"),
+            Some("NV"),
             now - chrono::Duration::seconds(18),
             2,
         ),
@@ -831,7 +932,7 @@ fn demo_runtime(spots_enabled: bool, spot_policy: SpotPolicy) -> Runtime {
             1,
         ),
     ]);
-    Runtime {
+    let mut runtime = Runtime {
         qsos,
         spots,
         operations: vec![Operation {
@@ -848,6 +949,7 @@ fn demo_runtime(spots_enabled: bool, spot_policy: SpotPolicy) -> Runtime {
         lofi_status: "demo mode; LoFi can still be linked below".into(),
         lofi_account_call: None,
         import_diagnostics: adif::ImportDiagnostics::default(),
+        source_diagnostics: Vec::new(),
         spot_status: if spots_enabled {
             "demo candidates; live connection starting".into()
         } else {
@@ -856,7 +958,56 @@ fn demo_runtime(spots_enabled: bool, spot_policy: SpotPolicy) -> Runtime {
         spots_enabled,
         spot_policy,
         demo: true,
+    };
+    match scenario {
+        DemoScenario::Normal => {}
+        DemoScenario::NoLog => {
+            runtime.qsos.clear();
+            runtime.source = "Demo: no log loaded".into();
+            runtime.source_freshness = None;
+        }
+        DemoScenario::StaleAdif => {
+            runtime.source = "Demo: stale PoLo ADIF snapshot".into();
+            runtime.source_kind = Some(log_source::LogSourceKind::Adif);
+            runtime.source_freshness = Some(now - chrono::Duration::minutes(45));
+        }
+        DemoScenario::LofiUnavailable => {
+            runtime.lofi_status = "demo failure: LoFi unavailable".into();
+        }
+        DemoScenario::RbnDisconnected => {
+            runtime.spot_status = "demo failure: RBN disconnected".into();
+            for spot in &mut runtime.spots {
+                spot.stale = true;
+            }
+        }
+        DemoScenario::MalformedImport => {
+            runtime.import_diagnostics = adif::ImportDiagnostics {
+                records_seen: 1,
+                skipped: 1,
+                warnings: vec!["Record 1: malformed demo ADIF field".into()],
+                ..adif::ImportDiagnostics::default()
+            };
+        }
+        DemoScenario::UnresolvedExchange => {
+            let qso = Qso {
+                id: "demo-unresolved".into(),
+                call: "K1BAD".into(),
+                timestamp: Utc.with_ymd_and_hms(2026, 8, 1, 20, 30, 0).unwrap(),
+                band: Some(Band::B20),
+                frequency_khz: Some(14_040.0),
+                mode: "CW".into(),
+                name: None,
+                location: Some("MA".into()),
+                country: Some("United States".into()),
+                dxcc: Some(291),
+                contest_id: Some("NAQP-CW".into()),
+                deleted: false,
+                raw: Value::Null,
+            };
+            runtime.qsos.insert(qso.id.clone(), qso);
+        }
     }
+    runtime
 }
 
 fn demo_spot(
@@ -957,7 +1108,7 @@ mod tests {
 
     #[test]
     fn normal_runtime_restores_last_good_log_state() {
-        let demo = demo_runtime(false, SpotPolicy::default());
+        let demo = demo_runtime(false, SpotPolicy::default(), DemoScenario::Normal);
         let persisted = storage::PersistedState::new(
             demo.qsos.clone(),
             Some("restored-operation".into()),
@@ -965,6 +1116,7 @@ mod tests {
             "Live Ham2K LoFi sync".into(),
             demo.source_freshness,
             adif::ImportDiagnostics::default(),
+            Vec::new(),
         );
 
         let runtime = Runtime::normal(false, SpotPolicy::default(), Some(persisted));
@@ -980,7 +1132,7 @@ mod tests {
 
     #[test]
     fn disconnect_marks_existing_candidates_stale() {
-        let mut runtime = demo_runtime(true, SpotPolicy::default());
+        let mut runtime = demo_runtime(true, SpotPolicy::default(), DemoScenario::Normal);
 
         update_cluster_status(
             &mut runtime,
@@ -993,7 +1145,7 @@ mod tests {
 
     #[test]
     fn refreshed_candidate_is_no_longer_stale() {
-        let mut runtime = demo_runtime(true, SpotPolicy::default());
+        let mut runtime = demo_runtime(true, SpotPolicy::default(), DemoScenario::Normal);
         update_cluster_status(
             &mut runtime,
             rbn::ConnectionState::Disconnected,
@@ -1125,7 +1277,7 @@ mod tests {
 
     #[test]
     fn classifies_same_band_worked_and_cross_band_verified_multiplier() {
-        let runtime = demo_runtime(true, SpotPolicy::default());
+        let runtime = demo_runtime(true, SpotPolicy::default(), DemoScenario::Normal);
 
         assert_eq!(
             classify_spot(&runtime, "W1AW", Band::B20),
@@ -1135,5 +1287,72 @@ mod tests {
             classify_spot(&runtime, "N6RO", Band::B20),
             (SpotClass::VerifiedMultiplier, Some("CA".into()))
         );
+    }
+
+    #[test]
+    fn multiplier_matrix_exposes_all_rows_and_non_color_states() {
+        let runtime = demo_runtime(true, SpotPolicy::default(), DemoScenario::Normal);
+        let public = runtime.public();
+
+        assert_eq!(public.multiplier_matrix.len(), 111);
+        let state_for = |id: &str, band: Band| {
+            public
+                .multiplier_matrix
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .cells
+                .iter()
+                .find(|cell| cell.band == band)
+                .unwrap()
+                .state
+        };
+        assert_eq!(state_for("CT", Band::B20), MatrixCellState::Worked);
+        assert_eq!(state_for("CA", Band::B20), MatrixCellState::VerifiedSpotted);
+        assert_eq!(state_for("NV", Band::B20), MatrixCellState::PossibleSpotted);
+        assert_eq!(state_for("MA", Band::B10), MatrixCellState::Needed);
+
+        let unresolved = demo_runtime(
+            true,
+            SpotPolicy::default(),
+            DemoScenario::UnresolvedExchange,
+        )
+        .public();
+        assert_eq!(
+            unresolved
+                .multiplier_matrix
+                .iter()
+                .find(|row| row.id == "MA")
+                .unwrap()
+                .cells
+                .iter()
+                .find(|cell| cell.band == Band::B20)
+                .unwrap()
+                .state,
+            MatrixCellState::Unresolved
+        );
+    }
+
+    #[test]
+    fn every_demo_failure_scenario_is_reproducible() {
+        let policy = SpotPolicy::default();
+        let no_log = demo_runtime(true, policy, DemoScenario::NoLog);
+        assert!(no_log.qsos.is_empty());
+        assert!(no_log.source_freshness.is_none());
+
+        let stale = demo_runtime(true, policy, DemoScenario::StaleAdif);
+        assert_eq!(stale.source_kind, Some(log_source::LogSourceKind::Adif));
+
+        let lofi = demo_runtime(true, policy, DemoScenario::LofiUnavailable);
+        assert!(lofi.lofi_status.contains("unavailable"));
+
+        let rbn = demo_runtime(true, policy, DemoScenario::RbnDisconnected);
+        assert!(rbn.spots.iter().all(|spot| spot.stale));
+
+        let malformed = demo_runtime(true, policy, DemoScenario::MalformedImport);
+        assert_eq!(malformed.import_diagnostics.skipped, 1);
+
+        let unresolved = demo_runtime(true, policy, DemoScenario::UnresolvedExchange);
+        assert_eq!(unresolved.public().score.unresolved_exchanges, 1);
     }
 }

@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::model::{Band, Operation, Qso};
+use crate::model::{Band, Operation, Qso, RecordDiagnostic, RecordReason};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Credentials {
@@ -26,6 +26,12 @@ struct Credentials {
 pub struct Registration {
     pub linked: bool,
     pub account_call: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct QsoBatch {
+    pub qsos: Vec<Qso>,
+    pub diagnostics: Vec<RecordDiagnostic>,
 }
 
 #[derive(Clone)]
@@ -132,9 +138,10 @@ impl LofiClient {
             .collect())
     }
 
-    pub async fn qsos(&self, operation_id: &str, synced_since: Option<i64>) -> Result<Vec<Qso>> {
+    pub async fn qsos(&self, operation_id: &str, synced_since: Option<i64>) -> Result<QsoBatch> {
         let path = format!("/v1/operations/{operation_id}/qsos");
         let mut all = Vec::new();
+        let mut diagnostics = Vec::new();
         let mut cursor: Option<i64> = None;
         loop {
             let since = synced_since.map(|value| value.to_string());
@@ -147,14 +154,18 @@ impl LofiClient {
                 query.push(("syncedUntilMillis", value.as_str()));
             }
             let response = self.get_protected(&path, &query).await?;
-            all.extend(
-                response
-                    .get("qsos")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(parse_qson),
-            );
+            for value in response
+                .get("qsos")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(qso) = parse_qson(value) {
+                    all.push(qso);
+                } else {
+                    diagnostics.push(diagnose_qson(value));
+                }
+            }
             let meta = response.pointer("/meta/qsos");
             let records_left = meta
                 .and_then(|value| value.get("records_left"))
@@ -168,7 +179,10 @@ impl LofiClient {
             }
             cursor = next;
         }
-        Ok(all)
+        Ok(QsoBatch {
+            qsos: all,
+            diagnostics,
+        })
     }
 
     async fn get_protected(&self, path: &str, query: &[(&str, &str)]) -> Result<Value> {
@@ -350,6 +364,39 @@ fn parse_qson(value: &Value) -> Option<Qso> {
     })
 }
 
+fn diagnose_qson(value: &Value) -> RecordDiagnostic {
+    let id = value.get("uuid").and_then(scalar_string);
+    let (reason, detail) = if value.get("event").is_some() {
+        (
+            RecordReason::EventOrNonContact,
+            "LoFi event/non-contact record".to_string(),
+        )
+    } else if value
+        .pointer("/their/call")
+        .or_else(|| value.pointer("/their/baseCall"))
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        (
+            RecordReason::MissingCall,
+            "LoFi record has no contacted callsign".to_string(),
+        )
+    } else if millis(value, &["startAtMillis", "endAtMillis"]).is_none()
+        && value.get("startAt").and_then(Value::as_str).is_none()
+    {
+        (
+            RecordReason::MissingTimestamp,
+            "LoFi record has no usable timestamp".to_string(),
+        )
+    } else {
+        (
+            RecordReason::MalformedRecord,
+            "LoFi record could not be normalized".to_string(),
+        )
+    };
+    RecordDiagnostic { id, reason, detail }
+}
+
 fn split_exchange(value: &str) -> (Option<String>, Option<String>) {
     let mut pieces = value.split_whitespace();
     (
@@ -473,5 +520,21 @@ mod tests {
         }))
         .unwrap();
         assert!(deleted.deleted);
+    }
+
+    #[test]
+    fn explains_why_lofi_records_are_not_contacts() {
+        let event = diagnose_qson(&json!({"uuid":"event", "event":"break"}));
+        assert_eq!(event.reason, RecordReason::EventOrNonContact);
+
+        let missing_call = diagnose_qson(&json!({
+            "uuid":"missing-call", "startAtMillis":1785607200000_i64
+        }));
+        assert_eq!(missing_call.reason, RecordReason::MissingCall);
+
+        let missing_time = diagnose_qson(&json!({
+            "uuid":"missing-time", "their":{"call":"W1AW"}
+        }));
+        assert_eq!(missing_time.reason, RecordReason::MissingTimestamp);
     }
 }
