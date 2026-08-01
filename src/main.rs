@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Result, ensure};
 use axum::extract::{DefaultBodyLimit, Multipart, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -28,7 +28,8 @@ use serde_json::{Value, json};
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
-use tracing::{error, info, warn};
+use tower_http::trace::TraceLayer;
+use tracing::{error, info, info_span, warn};
 use tracing_subscriber::EnvFilter;
 
 const LOFI_LINK_POLL_INTERVAL: Duration = Duration::from_secs(8);
@@ -149,6 +150,10 @@ fn validate_rbn_config(rbn_enabled: bool, call: Option<&str>) -> Result<()> {
         "a login callsign is required when RBN is enabled; pass --call <CALL> with --rbn"
     );
     Ok(())
+}
+
+fn http_trace_path(uri: &Uri) -> &str {
+    uri.path()
 }
 
 #[derive(Clone)]
@@ -443,6 +448,27 @@ async fn main() -> Result<()> {
         .route("/api/operation", post(select_operation))
         .route("/api/demo", post(toggle_demo))
         .layer(DefaultBodyLimit::max(25 * 1024 * 1024))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    info_span!(
+                        "http.request",
+                        method = %request.method(),
+                        path = %http_trace_path(request.uri())
+                    )
+                })
+                .on_response(
+                    |response: &axum::http::Response<_>,
+                     latency: Duration,
+                     _span: &tracing::Span| {
+                        info!(
+                            status = response.status().as_u16(),
+                            latency_ms = latency.as_millis(),
+                            "HTTP response"
+                        );
+                    },
+                ),
+        )
         .with_state(state);
 
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), args.port);
@@ -1151,6 +1177,14 @@ mod tests {
 
         let args = Args::try_parse_from(["qso-sidecar", "--rbn", "--call", "N1RWJ"]).unwrap();
         assert!(args.rbn);
+    }
+
+    #[test]
+    fn http_tracing_excludes_query_values() {
+        let uri: Uri = "/api/state?email=private%40example.com&token=secret"
+            .parse()
+            .unwrap();
+        assert_eq!(http_trace_path(&uri), "/api/state");
     }
 
     #[test]

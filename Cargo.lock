@@ -953,6 +953,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -1568,6 +1569,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
  "url",
 ]
 

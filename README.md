@@ -106,6 +106,11 @@ mise run check
 mise run build
 ```
 
+GitHub Actions runs `mise run check` and `mise run build` for every pull request and
+push to `main`, using the same repository-managed stable Rust toolchain as local
+development. CI caches Cargo registry, Git checkout, and build data using only the
+runner platform and `Cargo.lock`; it does not depend on a developer machine's state.
+
 ## Connect to PoLo through LoFi
 
 1. Start Sidecar and open <http://127.0.0.1:7878>.
@@ -175,8 +180,10 @@ CLI flags also have environment-variable equivalents:
 | `--demo-scenario` | `QSO_SIDECAR_DEMO_SCENARIO` | `normal` |
 | `--lofi-base` | `QSO_SIDECAR_LOFI_BASE` | `https://lofi.ham2k.net` |
 
-The HTTP listener always binds to `127.0.0.1`. Use `RUST_LOG=qso_sidecar=debug` for
-additional diagnostics; credentials and QSO payloads are not logged.
+The HTTP listener always binds to `127.0.0.1`. Each response emits structured method,
+path, status, and latency fields. Query strings, headers, and request or response bodies
+are deliberately excluded, so LoFi tokens, email addresses, and QSO payloads are not
+logged. Use `RUST_LOG=qso_sidecar=debug` for additional safe diagnostics.
 
 ## Rust support and contributing
 
