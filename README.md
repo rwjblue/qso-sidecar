@@ -180,10 +180,25 @@ themselves require an assisted entry. The dashboard lists each active source and
 capability.
 
 Spots never award QSO or multiplier credit. An exchange copied from a worked QSO on
-another band is labeled **verified needed**. An arbitrary RBN callsign without local-log
-evidence remains **unknown**; Sidecar does not infer contest participation or a
-multiplier. See [`docs/rbn-pipeline.md`](docs/rbn-pipeline.md) for aggregation, expiry,
-and the classification evidence policy.
+another band is labeled **verified needed**. An exchange found only in an imported N1MM
+Call History file is shown separately as a **history match** (`~`), because history does
+not prove current participation or a correct current exchange. An arbitrary RBN callsign
+without either source remains **unknown**.
+
+The default **Focus** view limits the queue to fresh, unworked candidates on the current
+band. Candidate ordering favors the current band, stronger evidence, configured preferred
+skimmers, independent skimmer count, report count, and recency. Use **Hold list** while
+reading; incoming candidates are counted until they are released into the list. The RBN
+relay does not support server-side filters, so nearby skimmers can be prioritized locally
+by callsign:
+
+```bash
+QSO_SIDECAR_CALL=N1RWJ mise run start -- --rbn \
+  --preferred-rbn-spotters WZ7I,K3LR
+```
+
+See [`docs/rbn-pipeline.md`](docs/rbn-pipeline.md) for aggregation, expiry, ranking, and
+the classification evidence policy.
 
 ## Configuration
 
@@ -199,6 +214,7 @@ CLI flags also have environment-variable equivalents:
 | `--spot-dedupe-seconds` | `QSO_SIDECAR_SPOT_DEDUPE_SECONDS` | `90` |
 | `--spot-dedupe-khz` | `QSO_SIDECAR_SPOT_DEDUPE_KHZ` | `1.0` |
 | `--spot-capacity` | `QSO_SIDECAR_SPOT_CAPACITY` | `200` |
+| `--preferred-rbn-spotters` | `QSO_SIDECAR_PREFERRED_RBN_SPOTTERS` | none |
 | `--demo` | `QSO_SIDECAR_DEMO` | false |
 | `--demo-scenario` | `QSO_SIDECAR_DEMO_SCENARIO` | `normal` |
 | `--lofi-base` | `QSO_SIDECAR_LOFI_BASE` | `https://lofi.ham2k.net` |

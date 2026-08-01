@@ -5,8 +5,13 @@
 #matrix td:first-child strong{display:inline-block;min-width:42px;color:var(--text)}
 #matrix td:first-child span{color:var(--muted);font-family:system-ui,sans-serif}
 #matrix td.verified_spotted{color:var(--cyan);font-weight:800;background:#12374680}
+#matrix td.predicted_spotted{color:var(--amber);font-weight:800;background:#38270c80}
 #matrix td.unresolved{color:var(--red);font-weight:800;background:#3d182080}
 .spot.stale{opacity:.55}
+.spot.predicted{border-left:3px solid var(--amber)}
+.spot.predicted .spot-class{color:var(--amber)}
+.filters .spot-hold{margin-left:auto}
+.filters .spot-hold.active{color:var(--amber);border-color:#7b571c;background:#38270c}
 
 @media(max-width:1049px){
   body{min-width:0}

@@ -13,6 +13,14 @@ and total capacity. Aggregated candidates retain the newest observation, recent 
 best SNR, total reports, and the distinct reporting skimmers. Disconnects keep the
 last-known candidates but mark them stale until each one is observed again.
 
+The public candidate queue is ranked rather than purely chronological: live candidates
+come before stale ones, the operator's current band comes first, evidence-backed candidates
+come before unknown and worked calls, configured preferred skimmers break ties, and broader
+skimmer corroboration precedes report count and recency. `--preferred-rbn-spotters` accepts
+a comma-separated list of node callsigns and marks a candidate preferred when any reporting
+skimmer matches. This is intentionally explicit: the [RBN port 7000 relay](https://www.reversebeacon.net/pages/Telnet%2Bservers%2B30)
+has no filtering features, and Sidecar does not guess a skimmer's location from its callsign.
+
 Reconnect delay uses capped exponential backoff with per-process ±20% jitter. The
 dashboard does not report a live connection merely because the TCP socket opened: it
 waits for a positive login acknowledgement containing the configured callsign or the
@@ -40,7 +48,10 @@ reports because it may include operator callsigns.
 Sidecar does not ship a callsign-history database and does not infer NAQP participation,
 location, or multiplier credit from an arbitrary RBN callsign. A candidate is shown as
 a verified multiplier only when a prior QSO in the operator's local log supplies a
-resolvable exchange; without that evidence it remains unknown.
+resolvable exchange. An operator-imported N1MM Call History location can instead produce
+a visibly tentative history match. It is never promoted to verified, never asserts current
+participation, and never affects the claimed score. Without either source, the candidate
+remains unknown.
 The official [NCJ results search](https://ncjweb.com/naqpscores/) contains historical
 submitted score/QTH data, not a versioned current call-history artifact with an
 identified reuse license. [NCJ has also cautioned](https://ncjweb.com/naqp-scores/ssbnaqp082022.pdf)
@@ -48,5 +59,5 @@ that call-history and callbook lookup can produce high exchange error rates. Wit
 current, provenance-preserving, legally reusable source, adding automatic exchange
 inference would be misleading.
 
-If a suitable source is added later, every inferred value must carry source/version
-provenance, remain visibly tentative, and never affect the claimed score.
+Any future automatically supplied inference source must carry source/version provenance,
+remain visibly tentative, and never affect the claimed score.

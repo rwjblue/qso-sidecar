@@ -83,6 +83,13 @@ struct Args {
     /// Maximum number of RBN candidates retained in memory.
     #[arg(long, default_value_t = 200, env = "QSO_SIDECAR_SPOT_CAPACITY")]
     spot_capacity: usize,
+    /// RBN skimmer callsigns to prioritize, comma separated (for example WZ7I,K3LR).
+    #[arg(
+        long,
+        value_delimiter = ',',
+        env = "QSO_SIDECAR_PREFERRED_RBN_SPOTTERS"
+    )]
+    preferred_rbn_spotters: Vec<String>,
     /// Override the LoFi API base for development.
     #[arg(
         long,
@@ -104,12 +111,13 @@ enum DemoScenario {
     UnresolvedExchange,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SpotPolicy {
     ttl: chrono::Duration,
     dedupe_window: chrono::Duration,
     dedupe_khz: f64,
     capacity: usize,
+    preferred_spotters: BTreeSet<String>,
 }
 
 impl Default for SpotPolicy {
@@ -119,6 +127,7 @@ impl Default for SpotPolicy {
             dedupe_window: chrono::Duration::seconds(90),
             dedupe_khz: 1.0,
             capacity: 200,
+            preferred_spotters: BTreeSet::new(),
         }
     }
 }
@@ -141,13 +150,32 @@ impl Args {
             self.spot_capacity > 0,
             "spot capacity must be greater than zero"
         );
+        let preferred_spotters: BTreeSet<_> = self
+            .preferred_rbn_spotters
+            .iter()
+            .map(|spotter| normalize_spotter(spotter))
+            .collect();
+        ensure!(
+            !preferred_spotters.contains(""),
+            "preferred RBN spotter callsigns cannot be empty"
+        );
         Ok(SpotPolicy {
             ttl: chrono::Duration::minutes(i64::try_from(self.spot_ttl_minutes)?),
             dedupe_window: chrono::Duration::seconds(i64::try_from(self.spot_dedupe_seconds)?),
             dedupe_khz: self.spot_dedupe_khz,
             capacity: self.spot_capacity,
+            preferred_spotters,
         })
     }
+}
+
+fn normalize_spotter(spotter: &str) -> String {
+    spotter
+        .trim()
+        .trim_end_matches("-#")
+        .trim_end_matches('#')
+        .trim_end_matches('-')
+        .to_ascii_uppercase()
 }
 
 fn validate_rbn_config(rbn_enabled: bool, call: Option<&str>) -> Result<()> {
@@ -269,6 +297,7 @@ struct MatrixCell {
 #[serde(rename_all = "snake_case")]
 enum MatrixCellState {
     Needed,
+    PredictedSpotted,
     VerifiedSpotted,
     Unresolved,
     Worked,
@@ -351,14 +380,14 @@ impl Runtime {
     fn public(&self) -> PublicState {
         let generated_at = Utc::now();
         let score = naqp::score(self.qsos.values().cloned());
-        let spots = self.fresh_spots(generated_at);
-        let multiplier_matrix = build_multiplier_matrix(&score, &spots);
         let current_band = self
             .qsos
             .values()
             .filter(|qso| !qso.deleted)
             .max_by_key(|qso| qso.timestamp)
             .and_then(|qso| qso.band);
+        let spots = self.fresh_spots(generated_at, current_band);
+        let multiplier_matrix = build_multiplier_matrix(&score, &spots);
         let mut source_policy = self.source_policy.clone();
         source_policy.set_enabled(
             SourceId::PoloLofi,
@@ -401,20 +430,43 @@ impl Runtime {
         }
     }
 
-    fn fresh_spots(&self, now: DateTime<Utc>) -> Vec<Spot> {
+    fn fresh_spots(&self, now: DateTime<Utc>, current_band: Option<Band>) -> Vec<Spot> {
         let mut spots: Vec<_> = self
             .spots
             .iter()
             .filter(|spot| now - spot.time <= self.spot_policy.ttl)
             .cloned()
             .collect();
-        spots.sort_by_key(|spot| std::cmp::Reverse(spot.time));
+        for spot in &mut spots {
+            (spot.class, spot.predicted_multiplier) = classify_spot(self, &spot.call, spot.band);
+        }
+        spots.sort_by_key(|spot| {
+            (
+                spot.stale,
+                current_band.is_some_and(|band| spot.band != band),
+                spot_class_priority(spot.class),
+                !spot.preferred_spotter,
+                std::cmp::Reverse(spot.spotters.len()),
+                std::cmp::Reverse(spot.reports),
+                std::cmp::Reverse(spot.time),
+            )
+        });
         spots
     }
 
     fn spots_enabled(&self) -> bool {
         self.source_policy
             .is_enabled(SourceId::ReverseBeaconNetwork)
+    }
+}
+
+fn spot_class_priority(class: SpotClass) -> u8 {
+    match class {
+        SpotClass::VerifiedMultiplier => 0,
+        SpotClass::PredictedMultiplier => 1,
+        SpotClass::NeededQso => 2,
+        SpotClass::Unknown => 3,
+        SpotClass::Worked => 4,
     }
 }
 
@@ -528,6 +580,13 @@ fn build_multiplier_matrix(score: &naqp::Score, spots: &[Spot]) -> Vec<MatrixRow
                             && spot.predicted_multiplier.as_deref() == Some(row.id)
                     }) {
                         MatrixCellState::VerifiedSpotted
+                    } else if spots.iter().any(|spot| {
+                        !spot.stale
+                            && spot.band == band
+                            && spot.class == SpotClass::PredictedMultiplier
+                            && spot.predicted_multiplier.as_deref() == Some(row.id)
+                    }) {
+                        MatrixCellState::PredictedSpotted
                     } else {
                         MatrixCellState::Needed
                     };
@@ -818,7 +877,11 @@ async fn toggle_demo(State(state): State<AppState>, Json(request): Json<DemoRequ
     let spots_enabled = state.runtime.read().await.spots_enabled();
     let mut runtime = state.runtime.write().await;
     if request.enabled {
-        *runtime = demo_runtime(spots_enabled, runtime.spot_policy, DemoScenario::Normal);
+        *runtime = demo_runtime(
+            spots_enabled,
+            runtime.spot_policy.clone(),
+            DemoScenario::Normal,
+        );
     } else {
         let restored = match state.store.load() {
             Ok(restored) => restored,
@@ -829,7 +892,7 @@ async fn toggle_demo(State(state): State<AppState>, Json(request): Json<DemoRequ
                 );
             }
         };
-        *runtime = Runtime::normal(spots_enabled, runtime.spot_policy, restored);
+        *runtime = Runtime::normal(spots_enabled, runtime.spot_policy.clone(), restored);
     }
     drop(runtime);
     state.updates.send(()).ok();
@@ -1002,6 +1065,10 @@ fn merge_spot(runtime: &mut Runtime, raw: rbn::RawSpot) {
             && (spot.frequency_khz - raw.frequency_khz).abs() <= runtime.spot_policy.dedupe_khz
     }) {
         existing.spotters.insert(raw.spotter.clone());
+        existing.preferred_spotter |= runtime
+            .spot_policy
+            .preferred_spotters
+            .contains(&normalize_spotter(&raw.spotter));
         existing.best_snr_db = match (existing.best_snr_db, raw.snr_db) {
             (Some(old), Some(new)) => Some(old.max(new)),
             (old, new) => old.or(new),
@@ -1018,6 +1085,10 @@ fn merge_spot(runtime: &mut Runtime, raw: rbn::RawSpot) {
         return;
     }
     let (class, predicted_multiplier) = classify_spot(runtime, &raw.call, raw.band);
+    let preferred_spotter = runtime
+        .spot_policy
+        .preferred_spotters
+        .contains(&normalize_spotter(&raw.spotter));
     runtime.spots.push_front(Spot {
         id: format!(
             "{}-{}-{}",
@@ -1037,6 +1108,7 @@ fn merge_spot(runtime: &mut Runtime, raw: rbn::RawSpot) {
         class,
         predicted_multiplier,
         reports: 1,
+        preferred_spotter,
         stale: false,
     });
     runtime.spots.truncate(runtime.spot_policy.capacity);
@@ -1070,6 +1142,28 @@ fn classify_spot(runtime: &Runtime, call: &str, band: Band) -> (SpotClass, Optio
     }
     if matching.iter().any(|qso| qso.country.is_some()) {
         return (SpotClass::NeededQso, None);
+    }
+    if let Some(history) = runtime.call_history.get(call)
+        && let Some(location) = history.location.as_deref()
+    {
+        if let Some(multiplier) = naqp_catalog::resolve(location, call, None) {
+            let already_have = runtime.qsos.values().any(|qso| {
+                qso.band == Some(band)
+                    && naqp::resolve_qso_multiplier(qso).map(|value| value.id)
+                        == Some(multiplier.id)
+            });
+            return if already_have {
+                (SpotClass::NeededQso, Some(multiplier.id.to_string()))
+            } else {
+                (
+                    SpotClass::PredictedMultiplier,
+                    Some(multiplier.id.to_string()),
+                )
+            };
+        }
+        if location == "DX" {
+            return (SpotClass::NeededQso, None);
+        }
     }
     (SpotClass::Unknown, None)
 }
@@ -1246,6 +1340,7 @@ fn demo_spot(
         class,
         predicted_multiplier: multiplier.map(str::to_string),
         reports,
+        preferred_spotter: false,
         stale: false,
     }
 }
@@ -1448,6 +1543,18 @@ mod tests {
     }
 
     #[test]
+    fn preferred_rbn_spotters_are_normalized() {
+        let args =
+            Args::try_parse_from(["qso-sidecar", "--preferred-rbn-spotters", "wz7i-#, K3LR"])
+                .unwrap();
+
+        assert_eq!(
+            args.spot_policy().unwrap().preferred_spotters,
+            BTreeSet::from(["K3LR".into(), "WZ7I".into()])
+        );
+    }
+
+    #[test]
     fn normal_runtime_restores_last_good_log_state() {
         let demo = demo_runtime(false, SpotPolicy::default(), DemoScenario::Normal);
         let persisted = storage::PersistedState::new(
@@ -1611,14 +1718,14 @@ mod tests {
         assert_eq!(runtime.spots.len(), 25);
         assert!(
             runtime
-                .fresh_spots(now + chrono::Duration::seconds(61))
+                .fresh_spots(now + chrono::Duration::seconds(61), None)
                 .is_empty()
         );
     }
 
     #[test]
     fn classifies_same_band_worked_and_cross_band_verified_multiplier() {
-        let runtime = demo_runtime(true, SpotPolicy::default(), DemoScenario::Normal);
+        let mut runtime = demo_runtime(true, SpotPolicy::default(), DemoScenario::Normal);
 
         assert_eq!(
             classify_spot(&runtime, "W1AW", Band::B20),
@@ -1632,6 +1739,34 @@ mod tests {
             classify_spot(&runtime, "W7RN", Band::B20),
             (SpotClass::Unknown, None)
         );
+
+        runtime.call_history.insert(
+            "W7RN".into(),
+            call_history::CallHistoryEntry {
+                call: "W7RN".into(),
+                name: Some("TOM".into()),
+                location: Some("NV".into()),
+                imported_at: Utc::now(),
+            },
+        );
+        assert_eq!(
+            classify_spot(&runtime, "W7RN", Band::B20),
+            (SpotClass::PredictedMultiplier, Some("NV".into()))
+        );
+    }
+
+    #[test]
+    fn preferred_skimmers_rank_first_within_the_same_spot_class() {
+        let mut policy = SpotPolicy::default();
+        policy.preferred_spotters.insert("WZ7I".into());
+        let mut runtime = Runtime::normal(false, policy, None);
+        let now = Utc::now();
+        merge_spot(&mut runtime, raw_spot("K1ABC", 14_025.1, now, "K3LR-#", 20));
+        merge_spot(&mut runtime, raw_spot("W7RN", 14_026.1, now, "WZ7I-#", 10));
+
+        let spots = runtime.fresh_spots(now, Some(Band::B20));
+        assert_eq!(spots[0].call, "W7RN");
+        assert!(spots[0].preferred_spotter);
     }
 
     #[test]
@@ -1657,6 +1792,35 @@ mod tests {
         assert_eq!(state_for("NV", Band::B20), MatrixCellState::Needed);
         assert_eq!(state_for("MA", Band::B10), MatrixCellState::Needed);
 
+        let mut predicted = demo_runtime(true, SpotPolicy::default(), DemoScenario::Normal);
+        predicted.call_history.insert(
+            "W7RN".into(),
+            call_history::CallHistoryEntry {
+                call: "W7RN".into(),
+                name: None,
+                location: Some("NV".into()),
+                imported_at: Utc::now(),
+            },
+        );
+        merge_spot(
+            &mut predicted,
+            raw_spot("W7RN", 14_028.0, Utc::now(), "WZ7I-#", 12),
+        );
+        let predicted = predicted.public();
+        assert_eq!(
+            predicted
+                .multiplier_matrix
+                .iter()
+                .find(|row| row.id == "NV")
+                .unwrap()
+                .cells
+                .iter()
+                .find(|cell| cell.band == Band::B20)
+                .unwrap()
+                .state,
+            MatrixCellState::PredictedSpotted
+        );
+
         let unresolved = demo_runtime(
             true,
             SpotPolicy::default(),
@@ -1681,20 +1845,20 @@ mod tests {
     #[test]
     fn every_demo_failure_scenario_is_reproducible() {
         let policy = SpotPolicy::default();
-        let no_log = demo_runtime(true, policy, DemoScenario::NoLog);
+        let no_log = demo_runtime(true, policy.clone(), DemoScenario::NoLog);
         assert!(no_log.qsos.is_empty());
         assert!(no_log.source_freshness.is_none());
 
-        let stale = demo_runtime(true, policy, DemoScenario::StaleAdif);
+        let stale = demo_runtime(true, policy.clone(), DemoScenario::StaleAdif);
         assert_eq!(stale.source_kind, Some(log_source::LogSourceKind::Adif));
 
-        let lofi = demo_runtime(true, policy, DemoScenario::LofiUnavailable);
+        let lofi = demo_runtime(true, policy.clone(), DemoScenario::LofiUnavailable);
         assert!(lofi.lofi_status.contains("unavailable"));
 
-        let rbn = demo_runtime(true, policy, DemoScenario::RbnDisconnected);
+        let rbn = demo_runtime(true, policy.clone(), DemoScenario::RbnDisconnected);
         assert!(rbn.spots.iter().all(|spot| spot.stale));
 
-        let malformed = demo_runtime(true, policy, DemoScenario::MalformedImport);
+        let malformed = demo_runtime(true, policy.clone(), DemoScenario::MalformedImport);
         assert_eq!(malformed.import_diagnostics.skipped, 1);
 
         let unresolved = demo_runtime(true, policy, DemoScenario::UnresolvedExchange);

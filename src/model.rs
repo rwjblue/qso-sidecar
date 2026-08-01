@@ -437,6 +437,7 @@ impl StationEvidence {
 #[serde(rename_all = "snake_case")]
 pub enum SpotClass {
     VerifiedMultiplier,
+    PredictedMultiplier,
     NeededQso,
     Worked,
     Unknown,
@@ -457,6 +458,7 @@ pub struct Spot {
     pub class: SpotClass,
     pub predicted_multiplier: Option<String>,
     pub reports: u32,
+    pub preferred_spotter: bool,
     pub stale: bool,
 }
 
