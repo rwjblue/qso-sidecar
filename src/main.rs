@@ -155,6 +155,7 @@ fn validate_rbn_config(no_rbn: bool, call: Option<&str>) -> Result<()> {
 struct AppState {
     runtime: Arc<RwLock<Runtime>>,
     updates: broadcast::Sender<()>,
+    shutdown: broadcast::Sender<()>,
     lofi: lofi::LofiClient,
     store: storage::StateStore,
 }
@@ -410,6 +411,7 @@ async fn main() -> Result<()> {
         }
     };
     let (updates, _) = broadcast::channel(32);
+    let (shutdown, _) = broadcast::channel(1);
     let runtime = if args.demo {
         demo_runtime(!args.no_rbn, spot_policy, args.demo_scenario)
     } else {
@@ -418,6 +420,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         runtime: Arc::new(RwLock::new(runtime)),
         updates,
+        shutdown: shutdown.clone(),
         lofi,
         store,
     };
@@ -445,8 +448,15 @@ async fn main() -> Result<()> {
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), args.port);
     let listener = tokio::net::TcpListener::bind(address).await?;
     info!(%address, "QSO Sidecar ready");
+    let mut server_shutdown = shutdown.subscribe();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        shutdown.send(()).ok();
+    });
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            server_shutdown.recv().await.ok();
+        })
         .await?;
     Ok(())
 }
@@ -491,11 +501,21 @@ async fn api_state(State(state): State<AppState>) -> Json<PublicState> {
 async fn events(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
-    let stream = BroadcastStream::new(state.updates.subscribe()).filter_map(|event| match event {
+    let stream = event_stream(state.updates.subscribe(), state.shutdown.subscribe());
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+fn event_stream(
+    updates: broadcast::Receiver<()>,
+    mut shutdown: broadcast::Receiver<()>,
+) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+    let updates = BroadcastStream::new(updates).filter_map(|event| match event {
         Ok(()) => Some(Ok(Event::default().event("update").data("state"))),
         Err(_) => None,
     });
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    futures_util::StreamExt::take_until(updates, async move {
+        shutdown.recv().await.ok();
+    })
 }
 
 async fn import_adif(State(state): State<AppState>, mut multipart: Multipart) -> Response {
@@ -1076,6 +1096,26 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn event_stream_closes_on_shutdown() {
+        let (updates, _) = broadcast::channel(1);
+        let (shutdown, _) = broadcast::channel(1);
+        let stream = event_stream(updates.subscribe(), shutdown.subscribe());
+        tokio::pin!(stream);
+
+        updates.send(()).unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap();
+        assert!(event.is_some());
+
+        shutdown.send(()).unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap();
+        assert!(end.is_none());
+    }
 
     fn raw_spot(
         call: &str,
