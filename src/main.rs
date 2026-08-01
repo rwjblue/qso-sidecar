@@ -225,6 +225,7 @@ struct AppState {
 struct Runtime {
     qsos: BTreeMap<String, Qso>,
     call_history: BTreeMap<String, call_history::CallHistoryEntry>,
+    external_station_evidence: BTreeMap<String, StationEvidence>,
     spots: VecDeque<Spot>,
     operations: Vec<Operation>,
     selected_operation: Option<String>,
@@ -262,6 +263,7 @@ struct PublicState {
     call_history_diagnostics: call_history::ImportDiagnostics,
     source_diagnostics: Vec<model::RecordDiagnostic>,
     spot_status: String,
+    spot_feed_state: SpotFeedState,
     spots_enabled: bool,
     assisted_warning: Option<String>,
     source_capabilities: Vec<SourceStatus>,
@@ -304,6 +306,15 @@ enum MatrixCellState {
     Worked,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SpotFeedState {
+    Disabled,
+    Starting,
+    Live,
+    Degraded,
+}
+
 impl Runtime {
     fn normal(
         spots_enabled: bool,
@@ -321,6 +332,7 @@ impl Runtime {
             return Self {
                 qsos: restored.qsos,
                 call_history: BTreeMap::new(),
+                external_station_evidence: BTreeMap::new(),
                 spots: VecDeque::new(),
                 operations: Vec::new(),
                 selected_operation: restored.selected_operation,
@@ -341,6 +353,7 @@ impl Runtime {
         Self {
             qsos: BTreeMap::new(),
             call_history: BTreeMap::new(),
+            external_station_evidence: BTreeMap::new(),
             spots: VecDeque::new(),
             operations: Vec::new(),
             selected_operation: None,
@@ -399,6 +412,22 @@ impl Runtime {
             self.source_kind == Some(log_source::LogSourceKind::Adif),
         );
         let spots_enabled = source_policy.is_enabled(SourceId::ReverseBeaconNetwork);
+        let spot_feed_state = if !spots_enabled {
+            SpotFeedState::Disabled
+        } else {
+            let status = self.spot_status.to_ascii_lowercase();
+            if self.spots.iter().any(|spot| spot.stale)
+                || ["disconnect", "reconnect", "fail", "error", "degraded"]
+                    .iter()
+                    .any(|word| status.contains(word))
+            {
+                SpotFeedState::Degraded
+            } else if self.spots.is_empty() || status.contains("starting") {
+                SpotFeedState::Starting
+            } else {
+                SpotFeedState::Live
+            }
+        };
         PublicState {
             api_version: 1,
             generated_at,
@@ -418,6 +447,7 @@ impl Runtime {
             call_history_diagnostics: self.call_history_diagnostics.clone(),
             source_diagnostics: self.source_diagnostics.clone(),
             spot_status: self.spot_status.clone(),
+            spot_feed_state,
             spots_enabled,
             assisted_warning: source_policy.assisted_warning(),
             source_capabilities: source_policy.statuses(),
@@ -426,6 +456,7 @@ impl Runtime {
             station_intelligence: station_intelligence(
                 self.qsos.values(),
                 self.call_history.values(),
+                self.external_station_evidence.values(),
                 self.spots.iter(),
                 generated_at,
                 self.spot_policy.ttl,
@@ -437,6 +468,7 @@ impl Runtime {
         let evidence = station_evidence(
             self.qsos.values(),
             self.call_history.values(),
+            self.external_station_evidence.values(),
             self.spots.iter(),
             now,
             self.spot_policy.ttl,
@@ -484,11 +516,12 @@ fn spot_class_priority(class: SpotClass) -> u8 {
 fn station_intelligence<'a>(
     qsos: impl Iterator<Item = &'a Qso>,
     call_history: impl Iterator<Item = &'a call_history::CallHistoryEntry>,
+    external_evidence: impl Iterator<Item = &'a StationEvidence>,
     spots: impl Iterator<Item = &'a Spot>,
     now: DateTime<Utc>,
     spot_ttl: chrono::Duration,
 ) -> Vec<StationIntelligence> {
-    station_evidence(qsos, call_history, spots, now, spot_ttl)
+    station_evidence(qsos, call_history, external_evidence, spots, now, spot_ttl)
         .into_values()
         .map(|station| {
             let conclusion = station.conclusion_at(now);
@@ -515,11 +548,24 @@ fn station_key(stations: &BTreeMap<String, StationEvidence>, call: &str) -> Stri
 fn station_evidence<'a>(
     qsos: impl Iterator<Item = &'a Qso>,
     call_history: impl Iterator<Item = &'a call_history::CallHistoryEntry>,
+    external_evidence: impl Iterator<Item = &'a StationEvidence>,
     spots: impl Iterator<Item = &'a Spot>,
     now: DateTime<Utc>,
     spot_ttl: chrono::Duration,
 ) -> BTreeMap<String, StationEvidence> {
     let mut stations = BTreeMap::<String, StationEvidence>::new();
+    for external in external_evidence {
+        let key = station_key(&stations, &external.call);
+        let station = stations
+            .entry(key)
+            .or_insert_with(|| StationEvidence::new(&external.call));
+        station
+            .participation
+            .extend(external.participation.iter().cloned());
+        station.activity.extend(external.activity.iter().cloned());
+        station.names.extend(external.names.iter().cloned());
+        station.locations.extend(external.locations.iter().cloned());
+    }
     for entry in call_history {
         let key = station_key(&stations, &entry.call);
         let station = stations
@@ -1172,6 +1218,7 @@ fn classify_spot(runtime: &Runtime, call: &str, band: Band) -> (SpotClass, Optio
     let evidence = station_evidence(
         runtime.qsos.values(),
         runtime.call_history.values(),
+        runtime.external_station_evidence.values(),
         runtime.spots.iter(),
         now,
         runtime.spot_policy.ttl,
@@ -1310,10 +1357,107 @@ fn demo_runtime(spots_enabled: bool, spot_policy: SpotPolicy, scenario: DemoScen
             now - chrono::Duration::seconds(51),
             1,
         ),
+        demo_spot(
+            "W5ACTIVE",
+            Band::B20,
+            14_039.2,
+            SpotClass::PredictedMultiplier,
+            Some("TX"),
+            now - chrono::Duration::seconds(18),
+            2,
+        ),
+        demo_spot(
+            "W7RN",
+            Band::B20,
+            14_042.1,
+            SpotClass::PredictedMultiplier,
+            Some("NV"),
+            now - chrono::Duration::seconds(27),
+            4,
+        ),
+        demo_spot(
+            "K0BOOK",
+            Band::B20,
+            14_044.4,
+            SpotClass::PredictedMultiplier,
+            Some("CO"),
+            now - chrono::Duration::seconds(43),
+            1,
+        ),
+        demo_spot(
+            "VE4PREFIX",
+            Band::B20,
+            14_047.7,
+            SpotClass::PredictedMultiplier,
+            Some("MB"),
+            now - chrono::Duration::seconds(58),
+            1,
+        ),
     ]);
+    let mut external_station_evidence = BTreeMap::new();
+    for (call, participation, location, location_confidence, source) in [
+        (
+            "W5TEAM",
+            Some(ParticipationConfidence::Declared),
+            Some("TX"),
+            LocationConfidence::ContestDeclared,
+            EvidenceSource::TeamRegistration,
+        ),
+        (
+            "W5ACTIVE",
+            Some(ParticipationConfidence::Declared),
+            Some("TX"),
+            LocationConfidence::ContestDeclared,
+            EvidenceSource::ContestOnlineScoreboard,
+        ),
+        (
+            "K0BOOK",
+            None,
+            Some("CO"),
+            LocationConfidence::Callbook,
+            EvidenceSource::Callbook,
+        ),
+        (
+            "VE4PREFIX",
+            None,
+            Some("MB"),
+            LocationConfidence::PrefixOnly,
+            EvidenceSource::Prefix,
+        ),
+    ] {
+        let mut station = StationEvidence::new(call);
+        if let Some(confidence) = participation {
+            station.participation.push(ParticipationEvidence {
+                confidence,
+                source,
+                observed_at: now - chrono::Duration::minutes(2),
+                expires_at: None,
+            });
+        }
+        if let Some(value) = location {
+            station.locations.push(LocationEvidence {
+                value: value.into(),
+                confidence: location_confidence,
+                source,
+                observed_at: now - chrono::Duration::minutes(2),
+                expires_at: None,
+            });
+        }
+        external_station_evidence.insert(call.into(), station);
+    }
+    let call_history = BTreeMap::from([(
+        "W7RN".into(),
+        call_history::CallHistoryEntry {
+            call: "W7RN".into(),
+            name: Some("TOM".into()),
+            location: Some("NV".into()),
+            imported_at: now - chrono::Duration::days(30),
+        },
+    )]);
     let mut runtime = Runtime {
         qsos,
-        call_history: BTreeMap::new(),
+        call_history,
+        external_station_evidence,
         spots,
         operations: vec![Operation {
             id: "demo-naqp".into(),
@@ -1598,6 +1742,44 @@ mod tests {
     }
 
     #[test]
+    fn demo_exercises_every_dashboard_confidence_and_location_provenance() {
+        let public = demo_runtime(true, SpotPolicy::default(), DemoScenario::Normal).public();
+        let participation: BTreeSet<_> = public
+            .station_intelligence
+            .iter()
+            .map(|station| station.participation.confidence)
+            .collect();
+        assert_eq!(
+            participation,
+            BTreeSet::from([
+                ParticipationConfidence::Unknown,
+                ParticipationConfidence::Probable,
+                ParticipationConfidence::Declared,
+                ParticipationConfidence::Confirmed,
+            ])
+        );
+
+        let locations: BTreeSet<_> = public
+            .station_intelligence
+            .iter()
+            .map(|station| station.location.confidence)
+            .collect();
+        assert!(locations.contains(&LocationConfidence::Unknown));
+        assert!(locations.contains(&LocationConfidence::PrefixOnly));
+        assert!(locations.contains(&LocationConfidence::Callbook));
+        assert!(locations.contains(&LocationConfidence::History));
+        assert!(locations.contains(&LocationConfidence::ContestDeclared));
+        assert!(locations.contains(&LocationConfidence::Verified));
+        assert_eq!(public.spot_feed_state, SpotFeedState::Starting);
+
+        let degraded =
+            demo_runtime(true, SpotPolicy::default(), DemoScenario::RbnDisconnected).public();
+        assert_eq!(degraded.spot_feed_state, SpotFeedState::Degraded);
+        let disabled = demo_runtime(false, SpotPolicy::default(), DemoScenario::Normal).public();
+        assert_eq!(disabled.spot_feed_state, SpotFeedState::Disabled);
+    }
+
+    #[test]
     fn http_tracing_excludes_query_values() {
         let uri: Uri = "/api/state?email=private%40example.com&token=secret"
             .parse()
@@ -1817,21 +1999,21 @@ mod tests {
             (SpotClass::VerifiedMultiplier, Some("CA".into()))
         );
         assert_eq!(
-            classify_spot(&runtime, "W7RN", Band::B20),
+            classify_spot(&runtime, "K9XYZ", Band::B20),
             (SpotClass::Unknown, None)
         );
 
         runtime.call_history.insert(
-            "W7RN".into(),
+            "K9XYZ".into(),
             call_history::CallHistoryEntry {
-                call: "W7RN".into(),
+                call: "K9XYZ".into(),
                 name: Some("TOM".into()),
                 location: Some("NV".into()),
                 imported_at: Utc::now(),
             },
         );
         assert_eq!(
-            classify_spot(&runtime, "W7RN", Band::B20),
+            classify_spot(&runtime, "K9XYZ", Band::B20),
             (SpotClass::PredictedMultiplier, Some("NV".into()))
         );
     }
@@ -1870,7 +2052,10 @@ mod tests {
         };
         assert_eq!(state_for("CT", Band::B20), MatrixCellState::Worked);
         assert_eq!(state_for("CA", Band::B20), MatrixCellState::VerifiedSpotted);
-        assert_eq!(state_for("NV", Band::B20), MatrixCellState::Needed);
+        assert_eq!(
+            state_for("NV", Band::B20),
+            MatrixCellState::PredictedSpotted
+        );
         assert_eq!(state_for("MA", Band::B10), MatrixCellState::Needed);
 
         let mut predicted = demo_runtime(true, SpotPolicy::default(), DemoScenario::Normal);

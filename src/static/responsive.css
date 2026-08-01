@@ -25,8 +25,8 @@
   .bands{grid-template-columns:repeat(3,1fr)}
   .matrix-panel{height:430px}
   .matrix-panel .table-wrap{height:332px}
-  .spots-panel{height:360px}
-  .spots{height:242px}
+  .spots-panel{height:430px}
+  .spots{height:290px}
   .filters{overflow-x:auto}
 }
 
@@ -38,7 +38,7 @@
   .legend{max-width:170px;text-align:right}
   #matrix td:first-child{width:66px;padding-left:8px}
   #matrix td:first-child span{display:none}
-  .spot{grid-template-columns:62px 1fr 70px;padding-inline:8px}
+  .spot{grid-template-columns:80px 1fr 70px;padding-inline:8px}
   .source-panel>p,.source-panel>form,.source-panel>select,.source-panel>label,.source-panel>.drop-zone{margin-inline:10px}
 }
 

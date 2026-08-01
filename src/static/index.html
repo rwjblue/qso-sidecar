@@ -32,7 +32,7 @@
           <div id="bands" class="bands"></div>
         </section>
         <section class="panel matrix-panel">
-          <div class="panel-head"><div><p class="eyebrow">ALL 111 MULTIPLIERS</p><h2>Multiplier matrix</h2></div><span class="legend">✓ worked · V verified · ~ history · ! unresolved · · needed</span></div>
+          <div class="panel-head"><div><p class="eyebrow">ALL 111 MULTIPLIERS</p><h2>Multiplier matrix</h2></div><span class="legend">✓ worked · V verified · ~ predicted · ! unresolved · · needed</span></div>
           <div id="matrix-filters" class="filters matrix-filters" role="group" aria-label="Multiplier groups">
             <button data-group="all" class="active" aria-pressed="true">All</button><button data-group="us_dc" aria-pressed="false">US/DC</button><button data-group="canada" aria-pressed="false">Canada</button><button data-group="other_north_america" aria-pressed="false">Other NA</button>
           </div>
@@ -43,8 +43,9 @@
       <aside class="right-column">
         <section class="panel spots-panel">
           <div class="panel-head"><div><p class="eyebrow">REVERSE BEACON NETWORK</p><h2>Fresh CW candidates</h2></div><span id="spot-status" class="status-dot">● —</span></div>
+          <div id="participant-summary" class="participant-summary" aria-label="Participant confidence summary"></div>
           <div id="spot-filters" class="filters" role="group" aria-label="Spot filters">
-            <button data-filter="focus" class="active" aria-pressed="true">Focus</button><button data-filter="multipliers" aria-pressed="false">Mult candidates</button><button data-filter="all" aria-pressed="false">All fresh</button><button id="spot-hold" class="spot-hold" type="button">Hold list</button>
+            <button data-filter="focus" class="active" aria-pressed="true">Focus</button><button data-filter="confirmed" aria-pressed="false">Confirmed</button><button data-filter="probable" aria-pressed="false">Probable</button><button data-filter="multipliers" aria-pressed="false">Mults</button><button data-filter="all" aria-pressed="false">All</button><button id="spot-hold" class="spot-hold" type="button">Hold</button>
           </div>
           <div id="spots" class="spots" aria-live="off"></div>
         </section>
