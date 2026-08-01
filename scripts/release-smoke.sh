@@ -19,7 +19,7 @@ trap 'stop_sidecar; rm -rf "$smoke_directory"' EXIT
 
 run_once() {
   local run_port="$1"
-  "$binary" --demo --no-rbn --port "$run_port" \
+  "$binary" --demo --port "$run_port" \
     --lofi-base http://127.0.0.1:9 >"${RUNNER_TEMP:-/tmp}/qso-sidecar-smoke.log" 2>&1 &
   sidecar_pid="$!"
 

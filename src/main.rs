@@ -58,12 +58,12 @@ struct Args {
         env = "QSO_SIDECAR_CLUSTER"
     )]
     cluster: String,
-    /// Callsign sent to the DX-cluster login prompt. Required unless RBN is disabled.
+    /// Callsign sent to the DX-cluster login prompt. Required when RBN is enabled.
     #[arg(long, env = "QSO_SIDECAR_CALL")]
     call: Option<String>,
-    /// Disable the live cluster connection (and remain Single Operator eligible).
-    #[arg(long, env = "QSO_SIDECAR_NO_RBN")]
-    no_rbn: bool,
+    /// Enable live RBN spots (requires a Single Operator Assisted entry).
+    #[arg(long, env = "QSO_SIDECAR_RBN")]
+    rbn: bool,
     /// Minutes before an RBN candidate expires.
     #[arg(long, default_value_t = 10, env = "QSO_SIDECAR_SPOT_TTL_MINUTES")]
     spot_ttl_minutes: u64,
@@ -143,10 +143,10 @@ impl Args {
     }
 }
 
-fn validate_rbn_config(no_rbn: bool, call: Option<&str>) -> Result<()> {
+fn validate_rbn_config(rbn_enabled: bool, call: Option<&str>) -> Result<()> {
     ensure!(
-        no_rbn || call.is_some_and(|call| !call.trim().is_empty()),
-        "a login callsign is required when RBN is enabled; pass --call <CALL> or disable RBN with --no-rbn"
+        !rbn_enabled || call.is_some_and(|call| !call.trim().is_empty()),
+        "a login callsign is required when RBN is enabled; pass --call <CALL> with --rbn"
     );
     Ok(())
 }
@@ -399,7 +399,7 @@ async fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
-    validate_rbn_config(args.no_rbn, args.call.as_deref())?;
+    validate_rbn_config(args.rbn, args.call.as_deref())?;
     let spot_policy = args.spot_policy()?;
     let lofi = lofi::LofiClient::new(args.lofi_base)?;
     let store = storage::StateStore::for_app()?;
@@ -413,9 +413,9 @@ async fn main() -> Result<()> {
     let (updates, _) = broadcast::channel(32);
     let (shutdown, _) = broadcast::channel(1);
     let runtime = if args.demo {
-        demo_runtime(!args.no_rbn, spot_policy, args.demo_scenario)
+        demo_runtime(args.rbn, spot_policy, args.demo_scenario)
     } else {
-        Runtime::normal(!args.no_rbn, spot_policy, restored)
+        Runtime::normal(args.rbn, spot_policy, restored)
     };
     let state = AppState {
         runtime: Arc::new(RwLock::new(runtime)),
@@ -426,7 +426,7 @@ async fn main() -> Result<()> {
     };
 
     tokio::spawn(run_lofi_sync(state.clone()));
-    if !args.no_rbn {
+    if args.rbn {
         spawn_cluster(state.clone(), args.cluster, args.call);
     }
 
@@ -1136,25 +1136,28 @@ mod tests {
     }
 
     #[test]
-    fn rbn_requires_a_login_callsign() {
-        let error = validate_rbn_config(false, None).unwrap_err();
+    fn enabled_rbn_requires_a_login_callsign() {
+        let error = validate_rbn_config(true, None).unwrap_err();
         assert!(error.to_string().contains("login callsign is required"));
-        assert!(validate_rbn_config(false, Some("N1RWJ")).is_ok());
-        assert!(validate_rbn_config(false, Some("   ")).is_err());
+        assert!(validate_rbn_config(true, Some("N1RWJ")).is_ok());
+        assert!(validate_rbn_config(true, Some("   ")).is_err());
     }
 
     #[test]
-    fn disabled_rbn_does_not_require_a_login_callsign() {
-        assert!(validate_rbn_config(true, None).is_ok());
+    fn rbn_is_disabled_by_default_and_does_not_require_a_login_callsign() {
+        let args = Args::try_parse_from(["qso-sidecar"]).unwrap();
+        assert!(!args.rbn);
+        assert!(validate_rbn_config(args.rbn, None).is_ok());
+
+        let args = Args::try_parse_from(["qso-sidecar", "--rbn", "--call", "N1RWJ"]).unwrap();
+        assert!(args.rbn);
     }
 
     #[test]
     fn spot_policy_rejects_unbounded_or_invalid_values() {
-        let args =
-            Args::try_parse_from(["qso-sidecar", "--no-rbn", "--spot-capacity", "0"]).unwrap();
+        let args = Args::try_parse_from(["qso-sidecar", "--spot-capacity", "0"]).unwrap();
         assert!(args.spot_policy().is_err());
-        let args =
-            Args::try_parse_from(["qso-sidecar", "--no-rbn", "--spot-dedupe-khz", "NaN"]).unwrap();
+        let args = Args::try_parse_from(["qso-sidecar", "--spot-dedupe-khz", "NaN"]).unwrap();
         assert!(args.spot_policy().is_err());
     }
 

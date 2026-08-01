@@ -1,7 +1,8 @@
 # Reverse Beacon Network pipeline
 
-Sidecar connects to the RBN Telnet endpoint only when spots are enabled and a login
-callsign is supplied. The RBN documents port 7000 as a combined CW and RTTY feed, so
+Sidecar connects to the RBN Telnet endpoint only when `--rbn` is explicitly enabled and
+a login callsign is supplied. Its default startup opens no cluster connection and is
+safe for an unassisted Single Operator entry. The RBN documents port 7000 as a combined CW and RTTY feed, so
 Sidecar accepts only well-formed DX lines carrying a numeric `WPM` observation. Other
 cluster output is ignored and is visible only with debug logging.
 

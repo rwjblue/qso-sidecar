@@ -8,7 +8,7 @@ $ErrorActionPreference = "Stop"
 
 function Invoke-SidecarSmoke([int]$RunPort) {
     $arguments = @(
-        "--demo", "--no-rbn", "--port", $RunPort,
+        "--demo", "--port", $RunPort,
         "--lofi-base", "http://127.0.0.1:9"
     )
     $process = Start-Process -FilePath $Binary -ArgumentList $arguments -PassThru

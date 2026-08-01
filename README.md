@@ -35,7 +35,7 @@ $Expected = ((Select-String -Path SHA256SUMS.txt -Pattern $Archive).Line -split 
 $Actual = (Get-FileHash -Algorithm SHA256 $Archive).Hash
 if ($Actual -ne $Expected) { throw "SHA-256 checksum mismatch" }
 Expand-Archive $Archive -DestinationPath qso-sidecar
-./qso-sidecar/qso-sidecar.exe --no-rbn
+./qso-sidecar/qso-sidecar.exe
 ```
 
 On macOS, choose the target automatically and verify with `shasum`:
@@ -48,7 +48,7 @@ base="https://github.com/rwjblue/qso-sidecar/releases/download/v${version}"
 curl -LO "$base/$archive" -LO "$base/SHA256SUMS.txt"
 grep "  $archive$" SHA256SUMS.txt | shasum -a 256 -c -
 tar -xzf "$archive"
-./qso-sidecar --no-rbn
+./qso-sidecar
 ```
 
 On Linux x64, use the musl archive and `sha256sum`:
@@ -60,7 +60,7 @@ base="https://github.com/rwjblue/qso-sidecar/releases/download/v${version}"
 curl -LO "$base/$archive" -LO "$base/SHA256SUMS.txt"
 grep "  $archive$" SHA256SUMS.txt | sha256sum -c -
 tar -xzf "$archive"
-./qso-sidecar --no-rbn
+./qso-sidecar
 ```
 
 Then open <http://127.0.0.1:7878>. Releases are intentionally not code-signed or
@@ -86,13 +86,13 @@ mise run start
 Open <http://127.0.0.1:7878>. To exercise the entire UI without showing a real log:
 
 ```bash
-mise run start -- --demo --no-rbn
+mise run start -- --demo
 ```
 
 Failure-state demos are also built in. For example:
 
 ```bash
-mise run start -- --demo --no-rbn --demo-scenario unresolved-exchange
+mise run start -- --demo --demo-scenario unresolved-exchange
 ```
 
 Available scenarios are `normal`, `no-log`, `stale-adif`, `lofi-unavailable`,
@@ -101,7 +101,7 @@ Available scenarios are `normal`, `no-log`, `stale-adif`, `lofi-unavailable`,
 Development and verification tasks:
 
 ```bash
-mise run dev -- --demo --no-rbn
+mise run dev -- --demo
 mise run check
 mise run build
 ```
@@ -138,17 +138,19 @@ an exchange fallback. Re-importing a growing snapshot is idempotent.
 
 ## Live CW spots and entry category
 
-By default Sidecar connects to `telnet.reversebeacon.net:7000`, so a login callsign is
-required:
+Sidecar does not connect to a spotting network by default, keeping its normal startup
+safe for an unassisted Single Operator entry. To explicitly enable RBN, supply both
+`--rbn` and a login callsign:
 
 ```bash
-QSO_SIDECAR_CALL=N1RWJ mise run start
+QSO_SIDECAR_CALL=N1RWJ mise run start -- --rbn
 ```
 
 **NAQP prohibits spotting/skimmer assistance for the Single Operator category.** Using
-the live candidate panel means entering Single Operator Assisted. To keep Sidecar safe
-for an unassisted entry, start it with `--no-rbn`; the dashboard also shows a persistent
-warning whenever spots are enabled.
+the live candidate panel means entering Single Operator Assisted. Sidecar opens no RBN
+connection unless `--rbn` (or `QSO_SIDECAR_RBN=true`) is explicitly set, and the
+dashboard shows a persistent warning whenever spots are enabled. The former `--no-rbn`
+option has been removed because disabled is now the default.
 
 Spots never award QSO or multiplier credit. An exchange copied from a worked QSO on
 another band is labeled **verified needed**; inference is explicitly labeled possible.
@@ -163,8 +165,8 @@ CLI flags also have environment-variable equivalents:
 | --- | --- | --- |
 | `--port` | `QSO_SIDECAR_PORT` | `7878` |
 | `--cluster` | `QSO_SIDECAR_CLUSTER` | `telnet.reversebeacon.net:7000` |
-| `--call` | `QSO_SIDECAR_CALL` | required unless `--no-rbn` |
-| `--no-rbn` | `QSO_SIDECAR_NO_RBN` | false |
+| `--call` | `QSO_SIDECAR_CALL` | required with `--rbn` |
+| `--rbn` | `QSO_SIDECAR_RBN` | false |
 | `--spot-ttl-minutes` | `QSO_SIDECAR_SPOT_TTL_MINUTES` | `10` |
 | `--spot-dedupe-seconds` | `QSO_SIDECAR_SPOT_DEDUPE_SECONDS` | `90` |
 | `--spot-dedupe-khz` | `QSO_SIDECAR_SPOT_DEDUPE_KHZ` | `1.0` |
