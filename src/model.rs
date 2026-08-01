@@ -99,6 +99,147 @@ impl Qso {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum EvidenceSource {
+    LocalQso,
+    ReverseBeaconNetwork,
+    ContestOnlineScoreboard,
+    TeamRegistration,
+    CallHistory,
+    Callbook,
+    Prefix,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParticipationConfidence {
+    Unknown,
+    Probable,
+    Declared,
+    Confirmed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocationConfidence {
+    Unknown,
+    PrefixOnly,
+    Callbook,
+    History,
+    ContestDeclared,
+    Verified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipationEvidence {
+    pub confidence: ParticipationConfidence,
+    pub source: EvidenceSource,
+    pub observed_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl ParticipationEvidence {
+    pub fn is_fresh(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at.is_none_or(|expires_at| expires_at > now)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocationEvidence {
+    pub value: String,
+    pub confidence: LocationConfidence,
+    pub source: EvidenceSource,
+    pub observed_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl LocationEvidence {
+    pub fn is_fresh(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at.is_none_or(|expires_at| expires_at > now)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipationConclusion {
+    pub confidence: ParticipationConfidence,
+    pub evidence: Vec<ParticipationEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocationConclusion {
+    pub value: Option<String>,
+    pub confidence: LocationConfidence,
+    pub evidence: Vec<LocationEvidence>,
+    pub conflicts: Vec<LocationEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StationEvidence {
+    pub call: String,
+    pub participation: Vec<ParticipationEvidence>,
+    pub locations: Vec<LocationEvidence>,
+}
+
+impl StationEvidence {
+    pub fn new(call: impl Into<String>) -> Self {
+        Self {
+            call: call.into().trim().to_ascii_uppercase(),
+            participation: Vec::new(),
+            locations: Vec::new(),
+        }
+    }
+
+    pub fn participation_at(&self, now: DateTime<Utc>) -> ParticipationConclusion {
+        let evidence: Vec<_> = self
+            .participation
+            .iter()
+            .filter(|item| item.is_fresh(now))
+            .cloned()
+            .collect();
+        let confidence = evidence
+            .iter()
+            .map(|item| item.confidence)
+            .max()
+            .unwrap_or(ParticipationConfidence::Unknown);
+        ParticipationConclusion {
+            confidence,
+            evidence,
+        }
+    }
+
+    pub fn location_at(&self, now: DateTime<Utc>) -> LocationConclusion {
+        let evidence: Vec<_> = self
+            .locations
+            .iter()
+            .filter(|item| item.is_fresh(now))
+            .cloned()
+            .collect();
+        let selected = evidence
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, item)| (item.confidence, item.observed_at, *index))
+            .map(|(_, item)| item);
+        let value = selected.map(|item| item.value.clone());
+        let confidence = selected
+            .map(|item| item.confidence)
+            .unwrap_or(LocationConfidence::Unknown);
+        let conflicts = selected.map_or_else(Vec::new, |selected| {
+            evidence
+                .iter()
+                .filter(|item| !item.value.eq_ignore_ascii_case(&selected.value))
+                .cloned()
+                .collect()
+        });
+        LocationConclusion {
+            value,
+            confidence,
+            evidence,
+            conflicts,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SpotClass {
     VerifiedMultiplier,
     NeededQso,
@@ -150,4 +291,180 @@ pub enum RecordReason {
     MissingCall,
     MissingTimestamp,
     MalformedRecord,
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use chrono::TimeZone;
+
+    use super::*;
+
+    fn time(minute: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 1, 18, minute, 0).unwrap()
+    }
+
+    fn participation(
+        confidence: ParticipationConfidence,
+        source: EvidenceSource,
+        observed_at: DateTime<Utc>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> ParticipationEvidence {
+        ParticipationEvidence {
+            confidence,
+            source,
+            observed_at,
+            expires_at,
+        }
+    }
+
+    fn location(
+        value: &str,
+        confidence: LocationConfidence,
+        source: EvidenceSource,
+        observed_at: DateTime<Utc>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> LocationEvidence {
+        LocationEvidence {
+            value: value.into(),
+            confidence,
+            source,
+            observed_at,
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn participation_and_location_confidence_are_independent() {
+        let mut station = StationEvidence::new(" k1abc ");
+        station.locations.push(location(
+            "CT",
+            LocationConfidence::History,
+            EvidenceSource::CallHistory,
+            time(0),
+            None,
+        ));
+
+        assert_eq!(station.call, "K1ABC");
+        assert_eq!(
+            station.participation_at(time(10)).confidence,
+            ParticipationConfidence::Unknown
+        );
+        assert_eq!(
+            station.location_at(time(10)).confidence,
+            LocationConfidence::History
+        );
+    }
+
+    #[test]
+    fn conclusions_retain_source_and_observation_time() {
+        let mut station = StationEvidence::new("K1ABC");
+        station.participation.push(participation(
+            ParticipationConfidence::Declared,
+            EvidenceSource::ContestOnlineScoreboard,
+            time(2),
+            None,
+        ));
+
+        let conclusion = station.participation_at(time(10));
+        assert_eq!(conclusion.confidence, ParticipationConfidence::Declared);
+        assert_eq!(
+            conclusion.evidence[0].source,
+            EvidenceSource::ContestOnlineScoreboard
+        );
+        assert_eq!(conclusion.evidence[0].observed_at, time(2));
+    }
+
+    #[test]
+    fn completed_local_qso_outranks_predictions_and_retains_conflicts() {
+        let mut station = StationEvidence::new("K1ABC");
+        station.locations.extend([
+            location(
+                "MA",
+                LocationConfidence::Callbook,
+                EvidenceSource::Callbook,
+                time(8),
+                None,
+            ),
+            location(
+                "CT",
+                LocationConfidence::Verified,
+                EvidenceSource::LocalQso,
+                time(1),
+                None,
+            ),
+        ]);
+
+        let conclusion = station.location_at(time(10));
+        assert_eq!(conclusion.value.as_deref(), Some("CT"));
+        assert_eq!(conclusion.confidence, LocationConfidence::Verified);
+        assert_eq!(conclusion.evidence.len(), 2);
+        assert_eq!(conclusion.conflicts.len(), 1);
+        assert_eq!(conclusion.conflicts[0].value, "MA");
+    }
+
+    #[test]
+    fn stale_live_evidence_is_removed_while_static_history_remains() {
+        let mut station = StationEvidence::new("K1ABC");
+        station.participation.extend([
+            participation(
+                ParticipationConfidence::Confirmed,
+                EvidenceSource::ContestOnlineScoreboard,
+                time(0),
+                Some(time(5)),
+            ),
+            participation(
+                ParticipationConfidence::Declared,
+                EvidenceSource::TeamRegistration,
+                time(0),
+                None,
+            ),
+        ]);
+
+        let conclusion = station.participation_at(time(10));
+        assert_eq!(conclusion.confidence, ParticipationConfidence::Declared);
+        assert_eq!(conclusion.evidence.len(), 1);
+        assert_eq!(
+            conclusion.evidence[0].source,
+            EvidenceSource::TeamRegistration
+        );
+    }
+
+    #[test]
+    fn equal_strength_location_conflicts_resolve_to_newest_observation() {
+        let mut station = StationEvidence::new("K1ABC");
+        station.locations.extend([
+            location(
+                "MA",
+                LocationConfidence::ContestDeclared,
+                EvidenceSource::ContestOnlineScoreboard,
+                time(1),
+                None,
+            ),
+            location(
+                "CT",
+                LocationConfidence::ContestDeclared,
+                EvidenceSource::ContestOnlineScoreboard,
+                time(2),
+                None,
+            ),
+        ]);
+
+        let conclusion = station.location_at(time(10));
+        assert_eq!(conclusion.value.as_deref(), Some("CT"));
+        assert_eq!(conclusion.conflicts[0].value, "MA");
+    }
+
+    #[test]
+    fn empty_evidence_resolves_to_unknown() {
+        let station = StationEvidence::new("K1ABC");
+        assert_eq!(
+            station.participation_at(time(0)).confidence,
+            ParticipationConfidence::Unknown
+        );
+        assert_eq!(station.location_at(time(0)).value, None);
+        assert_eq!(
+            station.location_at(time(0)).confidence,
+            LocationConfidence::Unknown
+        );
+    }
 }

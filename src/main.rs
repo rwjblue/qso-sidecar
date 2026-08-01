@@ -22,7 +22,11 @@ use axum::{Json, Router};
 use chrono::{DateTime, TimeZone, Utc};
 use clap::{Parser, ValueEnum};
 use futures_util::Stream;
-use model::{Band, Operation, Qso, Spot, SpotClass};
+use model::{
+    Band, EvidenceSource, LocationConclusion, LocationConfidence, LocationEvidence, Operation,
+    ParticipationConclusion, ParticipationConfidence, ParticipationEvidence, Qso, Spot, SpotClass,
+    StationEvidence,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{RwLock, broadcast, mpsc};
@@ -207,6 +211,14 @@ struct PublicState {
     assisted_warning: Option<&'static str>,
     demo: bool,
     current_band: Option<Band>,
+    station_intelligence: Vec<StationIntelligence>,
+}
+
+#[derive(Debug, Serialize)]
+struct StationIntelligence {
+    call: String,
+    participation: ParticipationConclusion,
+    location: LocationConclusion,
 }
 
 #[derive(Debug, Serialize)]
@@ -302,8 +314,9 @@ impl Runtime {
     }
 
     fn public(&self) -> PublicState {
+        let generated_at = Utc::now();
         let score = naqp::score(self.qsos.values().cloned());
-        let spots = self.fresh_spots(Utc::now());
+        let spots = self.fresh_spots(generated_at);
         let multiplier_matrix = build_multiplier_matrix(&score, &spots);
         let current_band = self
             .qsos
@@ -313,7 +326,7 @@ impl Runtime {
             .and_then(|qso| qso.band);
         PublicState {
             api_version: 1,
-            generated_at: Utc::now(),
+            generated_at,
             contest: naqp::contest_rules(),
             score,
             multiplier_matrix,
@@ -335,6 +348,7 @@ impl Runtime {
             ),
             demo: self.demo,
             current_band,
+            station_intelligence: station_intelligence(self.qsos.values(), generated_at),
         }
     }
 
@@ -348,6 +362,50 @@ impl Runtime {
         spots.sort_by_key(|spot| std::cmp::Reverse(spot.time));
         spots
     }
+}
+
+fn station_intelligence<'a>(
+    qsos: impl Iterator<Item = &'a Qso>,
+    now: DateTime<Utc>,
+) -> Vec<StationIntelligence> {
+    let mut stations = BTreeMap::<String, StationEvidence>::new();
+    for qso in qsos.filter(|qso| !qso.deleted) {
+        let call = qso.normalized_call();
+        if call.is_empty() {
+            continue;
+        }
+        let station = stations
+            .entry(call.clone())
+            .or_insert_with(|| StationEvidence::new(call));
+        station.participation.push(ParticipationEvidence {
+            confidence: ParticipationConfidence::Confirmed,
+            source: EvidenceSource::LocalQso,
+            observed_at: qso.timestamp,
+            expires_at: None,
+        });
+        if let Some(location) = qso
+            .location
+            .as_deref()
+            .map(str::trim)
+            .filter(|location| !location.is_empty())
+        {
+            station.locations.push(LocationEvidence {
+                value: location.to_ascii_uppercase(),
+                confidence: LocationConfidence::Verified,
+                source: EvidenceSource::LocalQso,
+                observed_at: qso.timestamp,
+                expires_at: None,
+            });
+        }
+    }
+    stations
+        .into_values()
+        .map(|station| StationIntelligence {
+            call: station.call.clone(),
+            participation: station.participation_at(now),
+            location: station.location_at(now),
+        })
+        .collect()
 }
 
 fn build_multiplier_matrix(score: &naqp::Score, spots: &[Spot]) -> Vec<MatrixRow> {
