@@ -25,10 +25,10 @@ use chrono::{DateTime, TimeZone, Utc};
 use clap::{Parser, ValueEnum};
 use futures_util::Stream;
 use model::{
-    Band, EvidenceSource, LocationConclusion, LocationConfidence, LocationEvidence, NameConclusion,
-    NameConfidence, NameEvidence, Operation, ParticipationConclusion, ParticipationConfidence,
-    ParticipationEvidence, Qso, SourceId, SourcePolicy, SourceStatus, Spot, SpotClass,
-    StationEvidence,
+    ActivityConclusion, ActivityEvidence, Band, EvidenceSource, LocationConclusion,
+    LocationConfidence, LocationEvidence, NameConclusion, NameConfidence, NameEvidence, Operation,
+    ParticipationConclusion, ParticipationConfidence, ParticipationEvidence, Qso, SourceId,
+    SourcePolicy, SourceStatus, Spot, SpotClass, StationEvidence,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -274,6 +274,7 @@ struct PublicState {
 struct StationIntelligence {
     call: String,
     participation: ParticipationConclusion,
+    activity: ActivityConclusion,
     name: NameConclusion,
     location: LocationConclusion,
 }
@@ -425,12 +426,21 @@ impl Runtime {
             station_intelligence: station_intelligence(
                 self.qsos.values(),
                 self.call_history.values(),
+                self.spots.iter(),
                 generated_at,
+                self.spot_policy.ttl,
             ),
         }
     }
 
     fn fresh_spots(&self, now: DateTime<Utc>, current_band: Option<Band>) -> Vec<Spot> {
+        let evidence = station_evidence(
+            self.qsos.values(),
+            self.call_history.values(),
+            self.spots.iter(),
+            now,
+            self.spot_policy.ttl,
+        );
         let mut spots: Vec<_> = self
             .spots
             .iter()
@@ -438,7 +448,8 @@ impl Runtime {
             .cloned()
             .collect();
         for spot in &mut spots {
-            (spot.class, spot.predicted_multiplier) = classify_spot(self, &spot.call, spot.band);
+            (spot.class, spot.predicted_multiplier) =
+                classify_spot_from_evidence(self, &evidence, &spot.call, spot.band, now);
         }
         spots.sort_by_key(|spot| {
             (
@@ -473,12 +484,46 @@ fn spot_class_priority(class: SpotClass) -> u8 {
 fn station_intelligence<'a>(
     qsos: impl Iterator<Item = &'a Qso>,
     call_history: impl Iterator<Item = &'a call_history::CallHistoryEntry>,
+    spots: impl Iterator<Item = &'a Spot>,
     now: DateTime<Utc>,
+    spot_ttl: chrono::Duration,
 ) -> Vec<StationIntelligence> {
+    station_evidence(qsos, call_history, spots, now, spot_ttl)
+        .into_values()
+        .map(|station| {
+            let conclusion = station.conclusion_at(now);
+            StationIntelligence {
+                call: conclusion.call,
+                participation: conclusion.participation,
+                activity: conclusion.activity,
+                name: conclusion.name,
+                location: conclusion.location,
+            }
+        })
+        .collect()
+}
+
+fn station_key(stations: &BTreeMap<String, StationEvidence>, call: &str) -> String {
+    let normalized = model::normalize_call(call);
+    stations
+        .keys()
+        .find(|candidate| model::calls_equivalent(candidate, &normalized))
+        .cloned()
+        .unwrap_or(normalized)
+}
+
+fn station_evidence<'a>(
+    qsos: impl Iterator<Item = &'a Qso>,
+    call_history: impl Iterator<Item = &'a call_history::CallHistoryEntry>,
+    spots: impl Iterator<Item = &'a Spot>,
+    now: DateTime<Utc>,
+    spot_ttl: chrono::Duration,
+) -> BTreeMap<String, StationEvidence> {
     let mut stations = BTreeMap::<String, StationEvidence>::new();
     for entry in call_history {
+        let key = station_key(&stations, &entry.call);
         let station = stations
-            .entry(entry.call.clone())
+            .entry(key)
             .or_insert_with(|| StationEvidence::new(&entry.call));
         if let Some(name) = &entry.name {
             station.names.push(NameEvidence {
@@ -504,8 +549,9 @@ fn station_intelligence<'a>(
         if call.is_empty() {
             continue;
         }
+        let key = station_key(&stations, &call);
         let station = stations
-            .entry(call.clone())
+            .entry(key)
             .or_insert_with(|| StationEvidence::new(call));
         station.participation.push(ParticipationEvidence {
             confidence: ParticipationConfidence::Confirmed,
@@ -542,15 +588,22 @@ fn station_intelligence<'a>(
             });
         }
     }
+    for spot in spots {
+        let expires_at = spot.time + spot_ttl;
+        if expires_at <= now {
+            continue;
+        }
+        let key = station_key(&stations, &spot.call);
+        let station = stations
+            .entry(key)
+            .or_insert_with(|| StationEvidence::new(&spot.call));
+        station.activity.push(ActivityEvidence {
+            source: EvidenceSource::ReverseBeaconNetwork,
+            observed_at: spot.time,
+            expires_at: Some(expires_at),
+        });
+    }
     stations
-        .into_values()
-        .map(|station| StationIntelligence {
-            call: station.call.clone(),
-            participation: station.participation_at(now),
-            name: station.name_at(now),
-            location: station.location_at(now),
-        })
-        .collect()
 }
 
 fn build_multiplier_matrix(score: &naqp::Score, spots: &[Spot]) -> Vec<MatrixRow> {
@@ -1115,10 +1168,28 @@ fn merge_spot(runtime: &mut Runtime, raw: rbn::RawSpot) {
 }
 
 fn classify_spot(runtime: &Runtime, call: &str, band: Band) -> (SpotClass, Option<String>) {
+    let now = Utc::now();
+    let evidence = station_evidence(
+        runtime.qsos.values(),
+        runtime.call_history.values(),
+        runtime.spots.iter(),
+        now,
+        runtime.spot_policy.ttl,
+    );
+    classify_spot_from_evidence(runtime, &evidence, call, band, now)
+}
+
+fn classify_spot_from_evidence(
+    runtime: &Runtime,
+    evidence: &BTreeMap<String, StationEvidence>,
+    call: &str,
+    band: Band,
+    now: DateTime<Utc>,
+) -> (SpotClass, Option<String>) {
     let matching: Vec<_> = runtime
         .qsos
         .values()
-        .filter(|qso| !qso.deleted && qso.normalized_call() == call)
+        .filter(|qso| !qso.deleted && model::calls_equivalent(&qso.normalized_call(), call))
         .collect();
     if matching.iter().any(|qso| qso.band == Some(band)) {
         return (SpotClass::Worked, None);
@@ -1143,10 +1214,15 @@ fn classify_spot(runtime: &Runtime, call: &str, band: Band) -> (SpotClass, Optio
     if matching.iter().any(|qso| qso.country.is_some()) {
         return (SpotClass::NeededQso, None);
     }
-    if let Some(history) = runtime.call_history.get(call)
-        && let Some(location) = history.location.as_deref()
+    if let Some(station) = evidence
+        .values()
+        .find(|station| model::calls_equivalent(&station.call, call))
     {
-        if let Some(multiplier) = naqp_catalog::resolve(location, call, None) {
+        let location = station.location_at(now);
+        let Some(location_value) = location.value.as_deref() else {
+            return (SpotClass::Unknown, None);
+        };
+        if let Some(multiplier) = naqp_catalog::resolve(location_value, call, None) {
             let already_have = runtime.qsos.values().any(|qso| {
                 qso.band == Some(band)
                     && naqp::resolve_qso_multiplier(qso).map(|value| value.id)
@@ -1154,6 +1230,11 @@ fn classify_spot(runtime: &Runtime, call: &str, band: Band) -> (SpotClass, Optio
             });
             return if already_have {
                 (SpotClass::NeededQso, Some(multiplier.id.to_string()))
+            } else if location.confidence == LocationConfidence::Verified {
+                (
+                    SpotClass::VerifiedMultiplier,
+                    Some(multiplier.id.to_string()),
+                )
             } else {
                 (
                     SpotClass::PredictedMultiplier,
@@ -1161,7 +1242,7 @@ fn classify_spot(runtime: &Runtime, call: &str, band: Band) -> (SpotClass, Optio
                 )
             };
         }
-        if location == "DX" {
+        if location_value == "DX" {
             return (SpotClass::NeededQso, None);
         }
     }

@@ -276,6 +276,19 @@ pub struct ParticipationEvidence {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityEvidence {
+    pub source: EvidenceSource,
+    pub observed_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl ActivityEvidence {
+    pub fn is_fresh(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at.is_none_or(|expires_at| expires_at > now)
+    }
+}
+
 impl ParticipationEvidence {
     pub fn is_fresh(&self, now: DateTime<Utc>) -> bool {
         self.expires_at.is_none_or(|expires_at| expires_at > now)
@@ -319,6 +332,12 @@ pub struct ParticipationConclusion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityConclusion {
+    pub currently_active: bool,
+    pub evidence: Vec<ActivityEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocationConclusion {
     pub value: Option<String>,
     pub confidence: LocationConfidence,
@@ -338,17 +357,61 @@ pub struct NameConclusion {
 pub struct StationEvidence {
     pub call: String,
     pub participation: Vec<ParticipationEvidence>,
+    pub activity: Vec<ActivityEvidence>,
     pub names: Vec<NameEvidence>,
     pub locations: Vec<LocationEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StationConclusion {
+    pub call: String,
+    pub participation: ParticipationConclusion,
+    pub activity: ActivityConclusion,
+    pub name: NameConclusion,
+    pub location: LocationConclusion,
+}
+
+pub fn normalize_call(call: &str) -> String {
+    call.trim().to_ascii_uppercase()
+}
+
+fn portable_base(call: &str) -> Option<&str> {
+    let (base, suffix) = call.rsplit_once('/')?;
+    matches!(suffix, "P" | "M" | "MM" | "QRP").then_some(base)
+}
+
+pub fn calls_equivalent(left: &str, right: &str) -> bool {
+    let left = normalize_call(left);
+    let right = normalize_call(right);
+    left == right
+        || portable_base(&left).is_some_and(|base| base == right)
+        || portable_base(&right).is_some_and(|base| base == left)
+        || portable_base(&left)
+            .zip(portable_base(&right))
+            .is_some_and(|(left, right)| left == right)
 }
 
 impl StationEvidence {
     pub fn new(call: impl Into<String>) -> Self {
         Self {
-            call: call.into().trim().to_ascii_uppercase(),
+            call: normalize_call(&call.into()),
             participation: Vec::new(),
+            activity: Vec::new(),
             names: Vec::new(),
             locations: Vec::new(),
+        }
+    }
+
+    pub fn activity_at(&self, now: DateTime<Utc>) -> ActivityConclusion {
+        let evidence: Vec<_> = self
+            .activity
+            .iter()
+            .filter(|item| item.is_fresh(now))
+            .cloned()
+            .collect();
+        ActivityConclusion {
+            currently_active: !evidence.is_empty(),
+            evidence,
         }
     }
 
@@ -359,11 +422,25 @@ impl StationEvidence {
             .filter(|item| item.is_fresh(now))
             .cloned()
             .collect();
-        let confidence = evidence
+        let base_confidence = evidence
             .iter()
             .map(|item| item.confidence)
             .max()
             .unwrap_or(ParticipationConfidence::Unknown);
+        let has_current_activity = self.activity_at(now).currently_active;
+        let has_history = self
+            .locations
+            .iter()
+            .any(|item| item.source == EvidenceSource::CallHistory && item.is_fresh(now));
+        let confidence = if base_confidence == ParticipationConfidence::Confirmed {
+            ParticipationConfidence::Confirmed
+        } else if has_current_activity
+            && (base_confidence == ParticipationConfidence::Declared || has_history)
+        {
+            ParticipationConfidence::Probable
+        } else {
+            base_confidence
+        };
         ParticipationConclusion {
             confidence,
             evidence,
@@ -429,6 +506,16 @@ impl StationEvidence {
             confidence,
             evidence,
             conflicts,
+        }
+    }
+
+    pub fn conclusion_at(&self, now: DateTime<Utc>) -> StationConclusion {
+        StationConclusion {
+            call: self.call.clone(),
+            participation: self.participation_at(now),
+            activity: self.activity_at(now),
+            name: self.name_at(now),
+            location: self.location_at(now),
         }
     }
 }
@@ -508,6 +595,18 @@ mod evidence_tests {
     ) -> ParticipationEvidence {
         ParticipationEvidence {
             confidence,
+            source,
+            observed_at,
+            expires_at,
+        }
+    }
+
+    fn activity(
+        source: EvidenceSource,
+        observed_at: DateTime<Utc>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> ActivityEvidence {
+        ActivityEvidence {
             source,
             observed_at,
             expires_at,
@@ -650,6 +749,127 @@ mod evidence_tests {
             conclusion.evidence[0].source,
             EvidenceSource::TeamRegistration
         );
+    }
+
+    #[test]
+    fn evidence_fusion_matrix_keeps_activity_distinct_from_participation() {
+        let mut local_qso = StationEvidence::new("K1LOCAL");
+        local_qso.participation.push(participation(
+            ParticipationConfidence::Confirmed,
+            EvidenceSource::LocalQso,
+            time(1),
+            None,
+        ));
+        assert_eq!(
+            local_qso.participation_at(time(10)).confidence,
+            ParticipationConfidence::Confirmed
+        );
+
+        let mut cosb = StationEvidence::new("K1COSB");
+        cosb.participation.push(participation(
+            ParticipationConfidence::Confirmed,
+            EvidenceSource::ContestOnlineScoreboard,
+            time(1),
+            Some(time(20)),
+        ));
+        cosb.activity.push(activity(
+            EvidenceSource::ReverseBeaconNetwork,
+            time(2),
+            Some(time(20)),
+        ));
+        assert_eq!(
+            cosb.participation_at(time(10)).confidence,
+            ParticipationConfidence::Confirmed
+        );
+        assert!(cosb.activity_at(time(10)).currently_active);
+
+        let mut declared = StationEvidence::new("K1TEAM");
+        declared.participation.push(participation(
+            ParticipationConfidence::Declared,
+            EvidenceSource::TeamRegistration,
+            time(1),
+            None,
+        ));
+        assert_eq!(
+            declared.participation_at(time(10)).confidence,
+            ParticipationConfidence::Declared
+        );
+        declared.activity.push(activity(
+            EvidenceSource::ReverseBeaconNetwork,
+            time(2),
+            Some(time(20)),
+        ));
+        assert_eq!(
+            declared.participation_at(time(10)).confidence,
+            ParticipationConfidence::Probable
+        );
+
+        let mut history = StationEvidence::new("K1HIST");
+        history.locations.push(location(
+            "CT",
+            LocationConfidence::History,
+            EvidenceSource::CallHistory,
+            time(1),
+            None,
+        ));
+        assert_eq!(
+            history.participation_at(time(10)).confidence,
+            ParticipationConfidence::Unknown
+        );
+        history.activity.push(activity(
+            EvidenceSource::ReverseBeaconNetwork,
+            time(2),
+            Some(time(20)),
+        ));
+        assert_eq!(
+            history.participation_at(time(10)).confidence,
+            ParticipationConfidence::Probable
+        );
+
+        let mut rbn_only = StationEvidence::new("K1RBN");
+        rbn_only.activity.push(activity(
+            EvidenceSource::ReverseBeaconNetwork,
+            time(2),
+            Some(time(20)),
+        ));
+        assert!(rbn_only.activity_at(time(10)).currently_active);
+        assert_eq!(
+            rbn_only.participation_at(time(10)).confidence,
+            ParticipationConfidence::Unknown
+        );
+    }
+
+    #[test]
+    fn expired_activity_no_longer_promotes_historical_evidence() {
+        let mut station = StationEvidence::new("K1ABC");
+        station.locations.push(location(
+            "CT",
+            LocationConfidence::History,
+            EvidenceSource::CallHistory,
+            time(0),
+            None,
+        ));
+        station.activity.push(activity(
+            EvidenceSource::ReverseBeaconNetwork,
+            time(0),
+            Some(time(5)),
+        ));
+
+        let conclusion = station.conclusion_at(time(10));
+        assert!(!conclusion.activity.currently_active);
+        assert_eq!(
+            conclusion.participation.confidence,
+            ParticipationConfidence::Unknown
+        );
+        assert_eq!(conclusion.location.value.as_deref(), Some("CT"));
+    }
+
+    #[test]
+    fn portable_suffixes_match_conservatively() {
+        assert!(calls_equivalent("k1abc", "K1ABC/P"));
+        assert!(calls_equivalent("K1ABC/M", "K1ABC/QRP"));
+        assert!(!calls_equivalent("K1ABC", "K1ABC/4"));
+        assert!(!calls_equivalent("EA8/K1ABC", "K1ABC"));
     }
 
     #[test]
