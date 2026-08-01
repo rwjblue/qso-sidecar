@@ -30,6 +30,12 @@
         <section class="panel bands-panel">
           <div class="panel-head"><div><p class="eyebrow">RUN RATE</p><h2>Band totals</h2></div><span id="current-band" class="pill neutral">Current —</span></div>
           <div id="bands" class="bands"></div>
+          <div class="rate-strip" aria-label="Rate and off-time guidance">
+            <div><span>10 MIN</span><strong id="rate-10">—</strong><small id="rate-10-count">—</small></div>
+            <div><span>60 MIN</span><strong id="rate-60">—</strong><small id="rate-60-count">—</small></div>
+            <div><span>SESSION</span><strong id="rate-session">—</strong><small id="rate-session-time">—</small></div>
+            <div class="rate-guidance"><span id="rate-trust" class="confidence unknown">INCOMPLETE</span><strong id="off-time-guidance">Waiting for log baseline</strong><small id="operating-remaining">—</small></div>
+          </div>
         </section>
         <section class="panel matrix-panel">
           <div class="panel-head"><div><p class="eyebrow">ALL 111 MULTIPLIERS</p><h2>Multiplier matrix</h2></div><span class="legend">✓ worked · V verified · ~ predicted · ! unresolved · · needed</span></div>

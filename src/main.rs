@@ -272,6 +272,7 @@ struct PublicState {
     current_band: Option<Band>,
     station_intelligence: Vec<StationIntelligence>,
     problem_findings: Vec<ProblemFinding>,
+    rate_guidance: RateGuidance,
 }
 
 #[derive(Debug, Serialize)]
@@ -315,6 +316,50 @@ struct ProblemFinding {
     explanation: String,
     suggested_next_step: String,
     evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MetricTrust {
+    Trusted,
+    Stale,
+    Incomplete,
+}
+
+#[derive(Debug, Serialize)]
+struct RateWindow {
+    minutes: i64,
+    qsos: usize,
+    hourly_rate: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct BandRate {
+    band: Band,
+    qsos_last_60: usize,
+    total_qsos: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct OffTimeGuidance {
+    idle_minutes: Option<i64>,
+    qualifying_off_time: bool,
+    minutes_until_qualified: Option<i64>,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RateGuidance {
+    trust: MetricTrust,
+    trust_message: String,
+    rolling_10: RateWindow,
+    rolling_60: RateWindow,
+    session_qsos: usize,
+    session_minutes: i64,
+    per_band: Vec<BandRate>,
+    off_time: OffTimeGuidance,
+    operating_minutes_remaining: i64,
+    operating_limit_warning: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -470,6 +515,13 @@ impl Runtime {
             self.source_kind,
             &self.source_diagnostics,
         );
+        let rate_guidance = build_rate_guidance(
+            &score,
+            &self.qsos,
+            generated_at,
+            self.source_kind,
+            self.source_freshness,
+        );
         PublicState {
             api_version: 1,
             generated_at,
@@ -504,6 +556,7 @@ impl Runtime {
                 self.spot_policy.ttl,
             ),
             problem_findings,
+            rate_guidance,
         }
     }
 
@@ -838,6 +891,137 @@ fn build_problem_findings(
         )
     });
     findings
+}
+
+fn rate_window(timestamps: &[DateTime<Utc>], now: DateTime<Utc>, minutes: i64) -> RateWindow {
+    let boundary = now - chrono::Duration::minutes(minutes);
+    let qsos = timestamps
+        .iter()
+        .filter(|timestamp| **timestamp > boundary && **timestamp <= now)
+        .count();
+    RateWindow {
+        minutes,
+        qsos,
+        hourly_rate: qsos * (60 / minutes as usize),
+    }
+}
+
+fn build_rate_guidance(
+    score: &naqp::Score,
+    qsos: &BTreeMap<String, Qso>,
+    now: DateTime<Utc>,
+    source_kind: Option<log_source::LogSourceKind>,
+    source_freshness: Option<DateTime<Utc>>,
+) -> RateGuidance {
+    let valid_ids: BTreeSet<_> = score
+        .qsos
+        .iter()
+        .filter(|qso| qso.status == naqp::QsoStatus::Valid)
+        .map(|qso| qso.id.as_str())
+        .collect();
+    let mut valid: Vec<_> = qsos
+        .values()
+        .filter(|qso| valid_ids.contains(qso.id.as_str()))
+        .collect();
+    valid.sort_by_key(|qso| qso.timestamp);
+    let timestamps: Vec<_> = valid.iter().map(|qso| qso.timestamp).collect();
+    let rolling_10 = rate_window(&timestamps, now, 10);
+    let rolling_60 = rate_window(&timestamps, now, 60);
+
+    let session_start = timestamps
+        .windows(2)
+        .rposition(|pair| pair[1] - pair[0] >= chrono::Duration::minutes(31))
+        .map_or(0, |index| index + 1);
+    let session = &timestamps[session_start.min(timestamps.len())..];
+    let session_minutes = session
+        .first()
+        .zip(session.last())
+        .map_or(0, |(first, last)| (*last - *first).num_minutes());
+
+    let per_band = Band::ALL
+        .into_iter()
+        .map(|band| BandRate {
+            band,
+            qsos_last_60: valid
+                .iter()
+                .filter(|qso| {
+                    qso.band == Some(band)
+                        && qso.timestamp > now - chrono::Duration::minutes(60)
+                        && qso.timestamp <= now
+                })
+                .count(),
+            total_qsos: valid.iter().filter(|qso| qso.band == Some(band)).count(),
+        })
+        .collect();
+
+    let idle_minutes = timestamps
+        .last()
+        .map(|last| (now - *last).num_minutes().max(0));
+    let qualifying_off_time = idle_minutes.is_some_and(|minutes| minutes >= 31);
+    let minutes_until_qualified = idle_minutes.map(|minutes| (31 - minutes).max(0));
+    let message = match (idle_minutes, qualifying_off_time) {
+        (None, _) => "No credited QSO baseline is available for off-time guidance.".into(),
+        (Some(minutes), true) => format!(
+            "The current {minutes}-minute gap qualifies as off time under the 31-minute rule."
+        ),
+        (Some(minutes), false) => format!(
+            "Keep the current gap for {} more minute(s) to qualify as off time.",
+            31 - minutes
+        ),
+    };
+
+    let stale_after = match source_kind {
+        Some(log_source::LogSourceKind::Lofi) => chrono::Duration::seconds(90),
+        Some(log_source::LogSourceKind::Adif) => chrono::Duration::minutes(15),
+        None => chrono::Duration::minutes(5),
+    };
+    let (trust, trust_message) = match source_freshness {
+        None => (
+            MetricTrust::Incomplete,
+            "No trusted log baseline; rates are not trustworthy zeroes.".into(),
+        ),
+        Some(freshness) if now - freshness > stale_after => (
+            MetricTrust::Stale,
+            format!(
+                "Log data is {} minute(s) old; rates may be incomplete.",
+                (now - freshness).num_minutes().max(1)
+            ),
+        ),
+        Some(_) => (
+            MetricTrust::Trusted,
+            "Rates are derived from the current normalized log.".into(),
+        ),
+    };
+    let operating_minutes_remaining =
+        (naqp::contest_rules().maximum_operating_minutes - score.operating_minutes).max(0);
+    let operating_limit_warning =
+        if score.operating_minutes >= naqp::contest_rules().maximum_operating_minutes {
+            Some("Configured operating-time limit reached or exceeded.".into())
+        } else if operating_minutes_remaining <= 30 {
+            Some(format!(
+                "Only {operating_minutes_remaining} operating minute(s) remain."
+            ))
+        } else {
+            None
+        };
+
+    RateGuidance {
+        trust,
+        trust_message,
+        rolling_10,
+        rolling_60,
+        session_qsos: session.len(),
+        session_minutes,
+        per_band,
+        off_time: OffTimeGuidance {
+            idle_minutes,
+            qualifying_off_time,
+            minutes_until_qualified,
+            message,
+        },
+        operating_minutes_remaining,
+        operating_limit_warning,
+    }
 }
 
 fn build_multiplier_matrix(score: &naqp::Score, spots: &[Spot]) -> Vec<MatrixRow> {
@@ -1894,6 +2078,125 @@ mod tests {
             snr_db: Some(snr_db),
             speed_wpm: Some(28),
         }
+    }
+
+    fn rate_qso(id: &str, call: &str, timestamp: DateTime<Utc>, band: Band) -> Qso {
+        Qso {
+            id: id.into(),
+            call: call.into(),
+            timestamp,
+            band: Some(band),
+            frequency_khz: None,
+            mode: "CW".into(),
+            name: Some("PAT".into()),
+            location: Some("CT".into()),
+            country: Some("United States".into()),
+            dxcc: Some(291),
+            contest_id: Some("NAQP-CW".into()),
+            deleted: false,
+            raw: Value::Null,
+        }
+    }
+
+    #[test]
+    fn rolling_rates_and_off_time_use_deterministic_clock_boundaries() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 1, 21, 0, 0).unwrap();
+        let qsos = BTreeMap::from([
+            (
+                "boundary".into(),
+                rate_qso(
+                    "boundary",
+                    "K1AAA",
+                    now - chrono::Duration::minutes(10),
+                    Band::B20,
+                ),
+            ),
+            (
+                "inside".into(),
+                rate_qso(
+                    "inside",
+                    "K1AAB",
+                    now - chrono::Duration::minutes(9),
+                    Band::B20,
+                ),
+            ),
+            (
+                "recent".into(),
+                rate_qso(
+                    "recent",
+                    "K1AAC",
+                    now - chrono::Duration::minutes(1),
+                    Band::B40,
+                ),
+            ),
+        ]);
+        let score = naqp::score(qsos.values().cloned());
+        let guidance = build_rate_guidance(&score, &qsos, now, None, Some(now));
+        assert_eq!(guidance.rolling_10.qsos, 2);
+        assert_eq!(guidance.rolling_10.hourly_rate, 12);
+        assert_eq!(guidance.rolling_60.qsos, 3);
+        assert_eq!(
+            guidance
+                .per_band
+                .iter()
+                .find(|rate| rate.band == Band::B20)
+                .unwrap()
+                .qsos_last_60,
+            2
+        );
+
+        let last = rate_qso(
+            "last",
+            "K1OFF",
+            now - chrono::Duration::minutes(30),
+            Band::B20,
+        );
+        let off_qsos = BTreeMap::from([(last.id.clone(), last)]);
+        let off_score = naqp::score(off_qsos.values().cloned());
+        let thirty = build_rate_guidance(&off_score, &off_qsos, now, None, Some(now));
+        assert!(!thirty.off_time.qualifying_off_time);
+        assert_eq!(thirty.off_time.minutes_until_qualified, Some(1));
+        let thirty_one = build_rate_guidance(
+            &off_score,
+            &off_qsos,
+            now + chrono::Duration::minutes(1),
+            None,
+            Some(now),
+        );
+        assert!(thirty_one.off_time.qualifying_off_time);
+        assert_eq!(thirty_one.off_time.minutes_until_qualified, Some(0));
+    }
+
+    #[test]
+    fn rate_guidance_recomputes_and_never_labels_missing_or_stale_data_as_zero() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 1, 21, 0, 0).unwrap();
+        let qso = rate_qso(
+            "one",
+            "K1ONE",
+            now - chrono::Duration::minutes(2),
+            Band::B20,
+        );
+        let mut qsos = BTreeMap::from([(qso.id.clone(), qso)]);
+        let score = naqp::score(qsos.values().cloned());
+        let current = build_rate_guidance(&score, &qsos, now, None, Some(now));
+        assert_eq!(current.trust, MetricTrust::Trusted);
+        assert_eq!(current.rolling_10.hourly_rate, 6);
+
+        qsos.get_mut("one").unwrap().deleted = true;
+        let deleted_score = naqp::score(qsos.values().cloned());
+        let deleted = build_rate_guidance(&deleted_score, &qsos, now, None, Some(now));
+        assert_eq!(deleted.rolling_10.qsos, 0);
+
+        let incomplete = build_rate_guidance(&deleted_score, &qsos, now, None, None);
+        assert_eq!(incomplete.trust, MetricTrust::Incomplete);
+        let stale = build_rate_guidance(
+            &score,
+            &qsos,
+            now,
+            Some(log_source::LogSourceKind::Lofi),
+            Some(now - chrono::Duration::minutes(2)),
+        );
+        assert_eq!(stale.trust, MetricTrust::Stale);
     }
 
     #[test]
