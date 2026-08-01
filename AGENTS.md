@@ -1,0 +1,1 @@
+jj-commit-default: auto

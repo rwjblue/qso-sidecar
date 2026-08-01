@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# -*- mode: sh; sh-shell: bash; -*-
+#MISE description="Run QSO Sidecar with automatic recompilation"
+
+set -euo pipefail
+cargo run -- "$@"
+

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# -*- mode: sh; sh-shell: bash; -*-
+#MISE description="Build the release binary with embedded web assets"
+
+set -euo pipefail
+cargo build --release
+
