@@ -5,5 +5,10 @@
 set -euo pipefail
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+cargo test --locked --all-features
+cargo metadata --locked --no-deps --format-version 1 >/dev/null
 
+package_list="$(mktemp)"
+trap 'rm -f "$package_list"' EXIT
+cargo package --locked --allow-dirty --list >"$package_list"
+diff -u package-contents.txt "$package_list"

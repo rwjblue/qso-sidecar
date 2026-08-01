@@ -114,6 +114,14 @@ CLI flags also have environment-variable equivalents:
 The HTTP listener always binds to `127.0.0.1`. Use `RUST_LOG=qso_sidecar=debug` for
 additional diagnostics; credentials and QSO payloads are not logged.
 
+## Rust support and contributing
+
+QSO Sidecar supports the current stable Rust toolchain rather than a fixed minimum
+supported Rust version. The checked-in mise configuration installs that toolchain,
+and release CI records `rustc -Vv` for every supported native target. Contributors
+should run `mise run check`; it verifies formatting, clippy, tests, Cargo metadata, and
+the exact contents of a future Cargo package.
+
 ## Scoring scope
 
 QSO Sidecar currently targets the August 2026 NAQP CW contest; its dates and scoring
