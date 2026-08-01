@@ -561,6 +561,12 @@ pub struct Operation {
     pub is_naqp: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorGoals {
+    pub qso: Option<usize>,
+    pub score: Option<usize>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecordDiagnostic {
     pub id: Option<String>,

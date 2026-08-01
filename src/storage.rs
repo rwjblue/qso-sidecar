@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::adif::ImportDiagnostics;
 use crate::log_source::LogSourceKind;
-use crate::model::{Qso, RecordDiagnostic};
+use crate::model::{OperatorGoals, Qso, RecordDiagnostic};
 
 const STATE_VERSION: u8 = 1;
 
@@ -26,6 +26,8 @@ pub struct PersistedState {
     pub import_diagnostics: ImportDiagnostics,
     #[serde(default)]
     pub source_diagnostics: Vec<RecordDiagnostic>,
+    #[serde(default)]
+    pub goals: OperatorGoals,
 }
 
 impl PersistedState {
@@ -47,7 +49,13 @@ impl PersistedState {
             source_freshness,
             import_diagnostics,
             source_diagnostics,
+            goals: OperatorGoals::default(),
         }
+    }
+
+    pub fn with_goals(mut self, goals: OperatorGoals) -> Self {
+        self.goals = goals;
+        self
     }
 }
 
@@ -159,12 +167,18 @@ mod tests {
     fn round_trips_last_good_state() {
         let directory = tempfile::tempdir().unwrap();
         let store = StateStore::at(directory.path().join("state.json")).unwrap();
-        store.save(&state("first")).unwrap();
+        let mut expected = state("first");
+        expected.goals = OperatorGoals {
+            qso: Some(300),
+            score: Some(50_000),
+        };
+        store.save(&expected).unwrap();
 
         let restored = store.load().unwrap().unwrap();
 
         assert_eq!(restored.source, "first");
         assert_eq!(restored.selected_operation.as_deref(), Some("operation"));
+        assert_eq!(restored.goals, expected.goals);
     }
 
     #[test]

@@ -31,6 +31,7 @@
   .finding-filters{grid-template-columns:repeat(3,minmax(0,1fr))}
   .finding-actions{grid-column:span 2}
   .rate-strip{grid-template-columns:repeat(3,1fr)}.rate-strip .rate-guidance{grid-column:1/-1}
+  .goal-bar{grid-template-columns:1fr 110px 130px}.goal-bar>strong{grid-column:1/-1}.goal-bar button{align-self:end}
 }
 
 @media(max-width:620px){
@@ -46,6 +47,7 @@
   .finding-actions{grid-column:span 2}
   .finding summary{grid-template-columns:58px 80px 1fr}.finding summary span:last-child{grid-column:2/-1}.finding-detail{padding-left:14px}
   .rate-strip{grid-template-columns:repeat(3,1fr)}.rate-strip>div{padding-inline:8px}.rate-strip .rate-guidance{grid-column:1/-1}
+  .goal-bar{grid-template-columns:1fr 1fr}.goal-bar>strong{grid-column:1/-1}.goal-bar button{grid-column:1/-1}
   .source-panel>p,.source-panel>form,.source-panel>select,.source-panel>label,.source-panel>.drop-zone{margin-inline:10px}
 }
 

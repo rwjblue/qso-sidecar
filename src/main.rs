@@ -27,8 +27,8 @@ use futures_util::Stream;
 use model::{
     ActivityConclusion, ActivityEvidence, Band, EvidenceSource, LocationConclusion,
     LocationConfidence, LocationEvidence, NameConclusion, NameConfidence, NameEvidence, Operation,
-    ParticipationConclusion, ParticipationConfidence, ParticipationEvidence, Qso, SourceId,
-    SourcePolicy, SourceStatus, Spot, SpotClass, StationEvidence,
+    OperatorGoals, ParticipationConclusion, ParticipationConfidence, ParticipationEvidence, Qso,
+    SourceId, SourcePolicy, SourceStatus, Spot, SpotClass, StationEvidence,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -110,6 +110,9 @@ enum DemoScenario {
     MalformedImport,
     UnresolvedExchange,
     ProblemQsos,
+    HighRate,
+    NoRecentQsos,
+    GoalVariance,
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +245,7 @@ struct Runtime {
     source_policy: SourcePolicy,
     spot_policy: SpotPolicy,
     demo: bool,
+    goals: OperatorGoals,
 }
 
 #[derive(Debug, Serialize)]
@@ -273,6 +277,7 @@ struct PublicState {
     station_intelligence: Vec<StationIntelligence>,
     problem_findings: Vec<ProblemFinding>,
     rate_guidance: RateGuidance,
+    goals: OperatorGoals,
 }
 
 #[derive(Debug, Serialize)]
@@ -360,6 +365,16 @@ struct RateGuidance {
     off_time: OffTimeGuidance,
     operating_minutes_remaining: i64,
     operating_limit_warning: Option<String>,
+    goal_pace: GoalPace,
+}
+
+#[derive(Debug, Serialize)]
+struct GoalPace {
+    expected_qsos: Option<usize>,
+    qso_delta: Option<i64>,
+    expected_score: Option<usize>,
+    score_delta: Option<i64>,
+    message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -429,6 +444,7 @@ impl Runtime {
                 source_policy,
                 spot_policy,
                 demo: false,
+                goals: restored.goals,
             };
         }
         Self {
@@ -450,6 +466,7 @@ impl Runtime {
             source_policy,
             spot_policy,
             demo: false,
+            goals: OperatorGoals::default(),
         }
     }
 
@@ -470,6 +487,7 @@ impl Runtime {
             self.import_diagnostics.clone(),
             source_diagnostics,
         )
+        .with_goals(self.goals.clone())
     }
 
     fn public(&self) -> PublicState {
@@ -521,6 +539,7 @@ impl Runtime {
             generated_at,
             self.source_kind,
             self.source_freshness,
+            &self.goals,
         );
         PublicState {
             api_version: 1,
@@ -557,6 +576,7 @@ impl Runtime {
             ),
             problem_findings,
             rate_guidance,
+            goals: self.goals.clone(),
         }
     }
 
@@ -912,6 +932,7 @@ fn build_rate_guidance(
     now: DateTime<Utc>,
     source_kind: Option<log_source::LogSourceKind>,
     source_freshness: Option<DateTime<Utc>>,
+    goals: &OperatorGoals,
 ) -> RateGuidance {
     let valid_ids: BTreeSet<_> = score
         .qsos
@@ -1004,6 +1025,39 @@ fn build_rate_guidance(
         } else {
             None
         };
+    let progress = (score.operating_minutes.max(0) as f64
+        / naqp::contest_rules().maximum_operating_minutes as f64)
+        .clamp(0.0, 1.0);
+    let expected_qsos = goals
+        .qso
+        .map(|goal| (goal as f64 * progress).round() as usize);
+    let qso_delta = expected_qsos.map(|expected| score.valid_qsos as i64 - expected as i64);
+    let expected_score = goals
+        .score
+        .map(|goal| (goal as f64 * progress).round() as usize);
+    let score_delta = expected_score.map(|expected| score.claimed_score as i64 - expected as i64);
+    let goal_message = if trust != MetricTrust::Trusted {
+        "Goal pace is unavailable until the log baseline is current.".into()
+    } else if goals.qso.is_none() && goals.score.is_none() {
+        "Set a QSO or score goal to track pace.".into()
+    } else {
+        let mut parts = Vec::new();
+        if let Some(delta) = qso_delta {
+            parts.push(if delta >= 0 {
+                format!("{delta} QSO ahead of pace")
+            } else {
+                format!("{} QSO behind pace", -delta)
+            });
+        }
+        if let Some(delta) = score_delta {
+            parts.push(if delta >= 0 {
+                format!("{delta} points ahead")
+            } else {
+                format!("{} points behind", -delta)
+            });
+        }
+        parts.join(" · ")
+    };
 
     RateGuidance {
         trust,
@@ -1021,6 +1075,13 @@ fn build_rate_guidance(
         },
         operating_minutes_remaining,
         operating_limit_warning,
+        goal_pace: GoalPace {
+            expected_qsos,
+            qso_delta,
+            expected_score,
+            score_delta,
+            message: goal_message,
+        },
     }
 }
 
@@ -1120,6 +1181,7 @@ async fn main() -> Result<()> {
         .route("/api/call-history", post(import_call_history))
         .route("/api/lofi/link", post(link_lofi))
         .route("/api/operation", post(select_operation))
+        .route("/api/goals", post(update_goals))
         .route("/api/demo", post(toggle_demo))
         .layer(DefaultBodyLimit::max(25 * 1024 * 1024))
         .layer(middleware::from_fn(trace_http_request))
@@ -1178,6 +1240,61 @@ async fn api_state(State(state): State<AppState>) -> Json<PublicState> {
     Json(state.runtime.read().await.public())
 }
 
+#[derive(Debug, Deserialize)]
+struct GoalRequest {
+    qso: Option<usize>,
+    score: Option<usize>,
+}
+
+async fn update_goals(
+    State(state): State<AppState>,
+    Json(request): Json<GoalRequest>,
+) -> Result<Json<OperatorGoals>, (StatusCode, String)> {
+    if request.qso.is_some_and(|goal| goal == 0 || goal > 100_000) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "QSO goal must be between 1 and 100000".into(),
+        ));
+    }
+    if request
+        .score
+        .is_some_and(|goal| goal == 0 || goal > 10_000_000_000)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "score goal must be between 1 and 10000000000".into(),
+        ));
+    }
+    let goals = OperatorGoals {
+        qso: request.qso,
+        score: request.score,
+    };
+    let mut runtime = state.runtime.write().await;
+    if !runtime.demo {
+        let persisted = storage::PersistedState::new(
+            runtime.qsos.clone(),
+            runtime.selected_operation.clone(),
+            runtime.source_kind,
+            runtime.source.clone(),
+            runtime.source_freshness,
+            runtime.import_diagnostics.clone(),
+            runtime.source_diagnostics.clone(),
+        )
+        .with_goals(goals.clone());
+        state.store.save(&persisted).map_err(|error| {
+            error!(%error, "could not persist operator goals");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not persist operator goals".into(),
+            )
+        })?;
+    }
+    runtime.goals = goals.clone();
+    drop(runtime);
+    state.updates.send(()).ok();
+    Ok(Json(goals))
+}
+
 async fn events(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
@@ -1230,7 +1347,8 @@ async fn import_adif(State(state): State<AppState>, mut multipart: Multipart) ->
                 Some(freshness),
                 diagnostics.clone(),
                 diagnostics.record_diagnostics.clone(),
-            );
+            )
+            .with_goals(runtime.goals.clone());
             if let Err(error) = state.store.save(&persisted) {
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1862,6 +1980,10 @@ fn demo_runtime(spots_enabled: bool, spot_policy: SpotPolicy, scenario: DemoScen
         },
         spot_policy,
         demo: true,
+        goals: OperatorGoals {
+            qso: Some(300),
+            score: Some(50_000),
+        },
     };
     match scenario {
         DemoScenario::Normal => {}
@@ -1982,6 +2104,33 @@ fn demo_runtime(spots_enabled: bool, spot_policy: SpotPolicy, scenario: DemoScen
                 detail: "A synthetic source record is missing a valid timestamp.".into(),
             });
         }
+        DemoScenario::HighRate => {
+            for index in 0..12 {
+                let qso = Qso {
+                    id: format!("demo-rate-{index}"),
+                    call: format!("K1R{index:02}"),
+                    timestamp: now - chrono::Duration::seconds(i64::from(index) * 40),
+                    band: Some(Band::B20),
+                    frequency_khz: Some(14_020.0 + f64::from(index)),
+                    mode: "CW".into(),
+                    name: Some("RATE".into()),
+                    location: Some("MA".into()),
+                    country: Some("United States".into()),
+                    dxcc: Some(291),
+                    contest_id: Some("NAQP-CW".into()),
+                    deleted: false,
+                    raw: Value::Null,
+                };
+                runtime.qsos.insert(qso.id.clone(), qso);
+            }
+        }
+        DemoScenario::NoRecentQsos => {}
+        DemoScenario::GoalVariance => {
+            runtime.goals = OperatorGoals {
+                qso: Some(500),
+                score: Some(1_000_000),
+            };
+        }
     }
     runtime
 }
@@ -2101,6 +2250,7 @@ mod tests {
     #[test]
     fn rolling_rates_and_off_time_use_deterministic_clock_boundaries() {
         let now = Utc.with_ymd_and_hms(2026, 8, 1, 21, 0, 0).unwrap();
+        let goals = OperatorGoals::default();
         let qsos = BTreeMap::from([
             (
                 "boundary".into(),
@@ -2131,7 +2281,7 @@ mod tests {
             ),
         ]);
         let score = naqp::score(qsos.values().cloned());
-        let guidance = build_rate_guidance(&score, &qsos, now, None, Some(now));
+        let guidance = build_rate_guidance(&score, &qsos, now, None, Some(now), &goals);
         assert_eq!(guidance.rolling_10.qsos, 2);
         assert_eq!(guidance.rolling_10.hourly_rate, 12);
         assert_eq!(guidance.rolling_60.qsos, 3);
@@ -2144,6 +2294,25 @@ mod tests {
                 .qsos_last_60,
             2
         );
+        let goal_guidance = build_rate_guidance(
+            &score,
+            &qsos,
+            now,
+            None,
+            Some(now),
+            &OperatorGoals {
+                qso: Some(300),
+                score: Some(50_000),
+            },
+        );
+        assert_eq!(
+            goal_guidance.goal_pace.qso_delta,
+            goal_guidance
+                .goal_pace
+                .expected_qsos
+                .map(|expected| score.valid_qsos as i64 - expected as i64)
+        );
+        assert!(goal_guidance.goal_pace.message.contains("pace"));
 
         let last = rate_qso(
             "last",
@@ -2153,7 +2322,7 @@ mod tests {
         );
         let off_qsos = BTreeMap::from([(last.id.clone(), last)]);
         let off_score = naqp::score(off_qsos.values().cloned());
-        let thirty = build_rate_guidance(&off_score, &off_qsos, now, None, Some(now));
+        let thirty = build_rate_guidance(&off_score, &off_qsos, now, None, Some(now), &goals);
         assert!(!thirty.off_time.qualifying_off_time);
         assert_eq!(thirty.off_time.minutes_until_qualified, Some(1));
         let thirty_one = build_rate_guidance(
@@ -2162,6 +2331,7 @@ mod tests {
             now + chrono::Duration::minutes(1),
             None,
             Some(now),
+            &goals,
         );
         assert!(thirty_one.off_time.qualifying_off_time);
         assert_eq!(thirty_one.off_time.minutes_until_qualified, Some(0));
@@ -2170,6 +2340,7 @@ mod tests {
     #[test]
     fn rate_guidance_recomputes_and_never_labels_missing_or_stale_data_as_zero() {
         let now = Utc.with_ymd_and_hms(2026, 8, 1, 21, 0, 0).unwrap();
+        let goals = OperatorGoals::default();
         let qso = rate_qso(
             "one",
             "K1ONE",
@@ -2178,16 +2349,16 @@ mod tests {
         );
         let mut qsos = BTreeMap::from([(qso.id.clone(), qso)]);
         let score = naqp::score(qsos.values().cloned());
-        let current = build_rate_guidance(&score, &qsos, now, None, Some(now));
+        let current = build_rate_guidance(&score, &qsos, now, None, Some(now), &goals);
         assert_eq!(current.trust, MetricTrust::Trusted);
         assert_eq!(current.rolling_10.hourly_rate, 6);
 
         qsos.get_mut("one").unwrap().deleted = true;
         let deleted_score = naqp::score(qsos.values().cloned());
-        let deleted = build_rate_guidance(&deleted_score, &qsos, now, None, Some(now));
+        let deleted = build_rate_guidance(&deleted_score, &qsos, now, None, Some(now), &goals);
         assert_eq!(deleted.rolling_10.qsos, 0);
 
-        let incomplete = build_rate_guidance(&deleted_score, &qsos, now, None, None);
+        let incomplete = build_rate_guidance(&deleted_score, &qsos, now, None, None, &goals);
         assert_eq!(incomplete.trust, MetricTrust::Incomplete);
         let stale = build_rate_guidance(
             &score,
@@ -2195,6 +2366,7 @@ mod tests {
             now,
             Some(log_source::LogSourceKind::Lofi),
             Some(now - chrono::Duration::minutes(2)),
+            &goals,
         );
         assert_eq!(stale.trust, MetricTrust::Stale);
     }
@@ -2374,6 +2546,20 @@ mod tests {
     }
 
     #[test]
+    fn rate_demo_scenarios_cover_high_idle_stale_and_goal_variance_states() {
+        let high = demo_runtime(true, SpotPolicy::default(), DemoScenario::HighRate).public();
+        assert!(high.rate_guidance.rolling_10.qsos >= 12);
+        let idle = demo_runtime(true, SpotPolicy::default(), DemoScenario::NoRecentQsos).public();
+        assert_eq!(idle.rate_guidance.rolling_10.qsos, 0);
+        assert!(idle.rate_guidance.off_time.qualifying_off_time);
+        let stale = demo_runtime(true, SpotPolicy::default(), DemoScenario::StaleAdif).public();
+        assert_eq!(stale.rate_guidance.trust, MetricTrust::Stale);
+        let variance =
+            demo_runtime(true, SpotPolicy::default(), DemoScenario::GoalVariance).public();
+        assert!(variance.rate_guidance.goal_pace.message.contains("behind"));
+    }
+
+    #[test]
     fn http_tracing_excludes_query_values() {
         let uri: Uri = "/api/state?email=private%40example.com&token=secret"
             .parse()
@@ -2422,7 +2608,8 @@ mod tests {
             demo.source_freshness,
             adif::ImportDiagnostics::default(),
             Vec::new(),
-        );
+        )
+        .with_goals(demo.goals.clone());
 
         let runtime = Runtime::normal(false, SpotPolicy::default(), Some(persisted));
 
@@ -2432,6 +2619,7 @@ mod tests {
             Some("restored-operation")
         );
         assert_eq!(runtime.source_kind, Some(log_source::LogSourceKind::Lofi));
+        assert_eq!(runtime.goals, demo.goals);
         assert!(runtime.source.starts_with("Restored last-good:"));
     }
 
