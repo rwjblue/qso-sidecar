@@ -103,16 +103,17 @@ pub fn score(qsos: impl IntoIterator<Item = Qso>) -> Score {
             .as_deref()
             .and_then(|location| location.split_whitespace().last())
             .and_then(normalize_multiplier);
-        let known_non_na = qso
-            .country
+        let explicit_non_na = qso
+            .location
             .as_deref()
-            .is_some_and(|country| !is_north_american_country(country));
+            .and_then(|location| location.split_whitespace().last())
+            .is_some_and(|location| location.trim_matches(['.', ',']).eq_ignore_ascii_case("DX"));
         let has_name = qso
             .name
             .as_deref()
             .is_some_and(|name| !name.trim().is_empty());
-        let unresolved = !has_name || (multiplier.is_none() && !known_non_na);
-        let complete_exchange = has_name && (multiplier.is_some() || known_non_na);
+        let unresolved = !has_name || (multiplier.is_none() && !explicit_non_na);
+        let complete_exchange = has_name && (multiplier.is_some() || explicit_non_na);
         let duplicate = complete_exchange && !seen.insert(key);
 
         if !complete_exchange {
@@ -168,20 +169,6 @@ pub fn score(qsos: impl IntoIterator<Item = Qso>) -> Score {
         multiplier_rows,
         qsos: scored,
     }
-}
-
-fn is_north_american_country(country: &str) -> bool {
-    let value = country.trim().to_ascii_uppercase();
-    [
-        "UNITED STATES",
-        "USA",
-        "CANADA",
-        "MEXICO",
-        "ALASKA",
-        "HAWAII",
-    ]
-    .iter()
-    .any(|item| value.contains(item))
 }
 
 fn operating_time(timestamps: &[chrono::DateTime<chrono::Utc>]) -> (i64, i64) {
@@ -266,12 +253,23 @@ mod tests {
 
     #[test]
     fn non_na_qso_counts_without_multiplier() {
-        let mut contact = qso("1", "DL1ABC", Band::B20, 0, "DX");
-        contact.country = Some("Germany".into());
+        let mut contact = qso("1", "DL1ABC", Band::B20, 0, "dx,");
+        contact.country = None;
         let result = score([contact]);
         assert_eq!(result.valid_qsos, 1);
         assert_eq!(result.total_multipliers, 0);
         assert_eq!(result.unresolved_exchanges, 0);
+    }
+
+    #[test]
+    fn country_alone_does_not_complete_exchange() {
+        let mut contact = qso("1", "DL1ABC", Band::B20, 0, "");
+        contact.location = None;
+        contact.country = Some("Germany".into());
+        let result = score([contact]);
+        assert_eq!(result.valid_qsos, 0);
+        assert_eq!(result.total_multipliers, 0);
+        assert_eq!(result.unresolved_exchanges, 1);
     }
 
     #[test]
