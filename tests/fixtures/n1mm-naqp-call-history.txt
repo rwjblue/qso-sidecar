@@ -1,0 +1,6 @@
+# Representative N1MM NAQP call history with a reordered column and an ignored field.
+!!Order!!,State,Call,Name,Notes
+ct,w1aw,Hiram,ARRL HQ
+ON,ve3ej,John,
+DX,dl1abc,Hans,unknown fields are safe
+MA,,Missing Call

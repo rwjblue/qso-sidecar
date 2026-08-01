@@ -58,6 +58,9 @@
           <div id="drop-zone" class="drop-zone" tabindex="0" role="button" aria-describedby="import-note">↥ <strong>Drop current PoLo ADIF here</strong><span>or press Enter to choose a file</span></div>
           <input id="file" type="file" accept=".adi,.adif,text/plain" hidden>
           <p id="import-note" class="diagnostics">Re-imports are idempotent. PoLo remains authoritative.</p>
+          <div id="history-drop-zone" class="drop-zone" tabindex="0" role="button" aria-describedby="history-note">↥ <strong>Drop N1MM Call History here</strong><span>comma- or semicolon-delimited text</span></div>
+          <input id="history-file" type="file" accept=".txt,.csv,text/plain" hidden>
+          <p id="history-note" class="diagnostics">Historical name/location predictions only; never current participation.</p>
         </section>
       </aside>
     </div>

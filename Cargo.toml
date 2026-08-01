@@ -16,6 +16,7 @@ include = [
     "README.md",
     "LICENSE",
     "docs/*.md",
+    "tests/fixtures/*.txt",
 ]
 
 [package.metadata.qso-sidecar]

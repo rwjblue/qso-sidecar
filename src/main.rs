@@ -1,4 +1,5 @@
 mod adif;
+mod call_history;
 mod lofi;
 mod log_source;
 mod model;
@@ -24,9 +25,10 @@ use chrono::{DateTime, TimeZone, Utc};
 use clap::{Parser, ValueEnum};
 use futures_util::Stream;
 use model::{
-    Band, EvidenceSource, LocationConclusion, LocationConfidence, LocationEvidence, Operation,
-    ParticipationConclusion, ParticipationConfidence, ParticipationEvidence, Qso, SourceId,
-    SourcePolicy, SourceStatus, Spot, SpotClass, StationEvidence,
+    Band, EvidenceSource, LocationConclusion, LocationConfidence, LocationEvidence, NameConclusion,
+    NameConfidence, NameEvidence, Operation, ParticipationConclusion, ParticipationConfidence,
+    ParticipationEvidence, Qso, SourceId, SourcePolicy, SourceStatus, Spot, SpotClass,
+    StationEvidence,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -194,6 +196,7 @@ struct AppState {
 #[derive(Debug)]
 struct Runtime {
     qsos: BTreeMap<String, Qso>,
+    call_history: BTreeMap<String, call_history::CallHistoryEntry>,
     spots: VecDeque<Spot>,
     operations: Vec<Operation>,
     selected_operation: Option<String>,
@@ -203,6 +206,7 @@ struct Runtime {
     lofi_status: String,
     lofi_account_call: Option<String>,
     import_diagnostics: adif::ImportDiagnostics,
+    call_history_diagnostics: call_history::ImportDiagnostics,
     source_diagnostics: Vec<model::RecordDiagnostic>,
     spot_status: String,
     source_policy: SourcePolicy,
@@ -227,6 +231,7 @@ struct PublicState {
     lofi_linked: bool,
     lofi_account_call: Option<String>,
     import_diagnostics: adif::ImportDiagnostics,
+    call_history_diagnostics: call_history::ImportDiagnostics,
     source_diagnostics: Vec<model::RecordDiagnostic>,
     spot_status: String,
     spots_enabled: bool,
@@ -241,6 +246,7 @@ struct PublicState {
 struct StationIntelligence {
     call: String,
     participation: ParticipationConclusion,
+    name: NameConclusion,
     location: LocationConclusion,
 }
 
@@ -284,6 +290,7 @@ impl Runtime {
         if let Some(restored) = restored {
             return Self {
                 qsos: restored.qsos,
+                call_history: BTreeMap::new(),
                 spots: VecDeque::new(),
                 operations: Vec::new(),
                 selected_operation: restored.selected_operation,
@@ -293,6 +300,7 @@ impl Runtime {
                 lofi_status: "starting LoFi client registration".into(),
                 lofi_account_call: None,
                 import_diagnostics: restored.import_diagnostics,
+                call_history_diagnostics: call_history::ImportDiagnostics::default(),
                 source_diagnostics: restored.source_diagnostics,
                 spot_status,
                 source_policy,
@@ -302,6 +310,7 @@ impl Runtime {
         }
         Self {
             qsos: BTreeMap::new(),
+            call_history: BTreeMap::new(),
             spots: VecDeque::new(),
             operations: Vec::new(),
             selected_operation: None,
@@ -311,6 +320,7 @@ impl Runtime {
             lofi_status: "starting LoFi client registration".into(),
             lofi_account_call: None,
             import_diagnostics: adif::ImportDiagnostics::default(),
+            call_history_diagnostics: call_history::ImportDiagnostics::default(),
             source_diagnostics: Vec::new(),
             spot_status,
             source_policy,
@@ -375,6 +385,7 @@ impl Runtime {
             lofi_linked: self.lofi_account_call.is_some(),
             lofi_account_call: self.lofi_account_call.clone(),
             import_diagnostics: self.import_diagnostics.clone(),
+            call_history_diagnostics: self.call_history_diagnostics.clone(),
             source_diagnostics: self.source_diagnostics.clone(),
             spot_status: self.spot_status.clone(),
             spots_enabled,
@@ -382,7 +393,11 @@ impl Runtime {
             source_capabilities: source_policy.statuses(),
             demo: self.demo,
             current_band,
-            station_intelligence: station_intelligence(self.qsos.values(), generated_at),
+            station_intelligence: station_intelligence(
+                self.qsos.values(),
+                self.call_history.values(),
+                generated_at,
+            ),
         }
     }
 
@@ -405,9 +420,33 @@ impl Runtime {
 
 fn station_intelligence<'a>(
     qsos: impl Iterator<Item = &'a Qso>,
+    call_history: impl Iterator<Item = &'a call_history::CallHistoryEntry>,
     now: DateTime<Utc>,
 ) -> Vec<StationIntelligence> {
     let mut stations = BTreeMap::<String, StationEvidence>::new();
+    for entry in call_history {
+        let station = stations
+            .entry(entry.call.clone())
+            .or_insert_with(|| StationEvidence::new(&entry.call));
+        if let Some(name) = &entry.name {
+            station.names.push(NameEvidence {
+                value: name.clone(),
+                confidence: NameConfidence::History,
+                source: EvidenceSource::CallHistory,
+                observed_at: entry.imported_at,
+                expires_at: None,
+            });
+        }
+        if let Some(location) = &entry.location {
+            station.locations.push(LocationEvidence {
+                value: location.clone(),
+                confidence: LocationConfidence::History,
+                source: EvidenceSource::CallHistory,
+                observed_at: entry.imported_at,
+                expires_at: None,
+            });
+        }
+    }
     for qso in qsos.filter(|qso| !qso.deleted) {
         let call = qso.normalized_call();
         if call.is_empty() {
@@ -422,6 +461,20 @@ fn station_intelligence<'a>(
             observed_at: qso.timestamp,
             expires_at: None,
         });
+        if let Some(name) = qso
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            station.names.push(NameEvidence {
+                value: name.to_owned(),
+                confidence: NameConfidence::Verified,
+                source: EvidenceSource::LocalQso,
+                observed_at: qso.timestamp,
+                expires_at: None,
+            });
+        }
         if let Some(location) = qso
             .location
             .as_deref()
@@ -442,6 +495,7 @@ fn station_intelligence<'a>(
         .map(|station| StationIntelligence {
             call: station.call.clone(),
             participation: station.participation_at(now),
+            name: station.name_at(now),
             location: station.location_at(now),
         })
         .collect()
@@ -533,6 +587,7 @@ async fn main() -> Result<()> {
         .route("/api/state", get(api_state))
         .route("/api/events", get(events))
         .route("/api/import", post(import_adif))
+        .route("/api/call-history", post(import_call_history))
         .route("/api/lofi/link", post(link_lofi))
         .route("/api/operation", post(select_operation))
         .route("/api/demo", post(toggle_demo))
@@ -663,6 +718,40 @@ async fn import_adif(State(state): State<AppState>, mut multipart: Multipart) ->
             runtime.source_kind = Some(log_source::LogSourceKind::Adif);
             runtime.source_freshness = Some(freshness);
             runtime.demo = false;
+            drop(runtime);
+            state.updates.send(()).ok();
+            Json(json!({"ok": true, "diagnostics": diagnostics})).into_response()
+        }
+        Err(error) => api_error(StatusCode::UNPROCESSABLE_ENTITY, format!("{error:#}")),
+    }
+}
+
+async fn import_call_history(State(state): State<AppState>, mut multipart: Multipart) -> Response {
+    let mut imported = None;
+    while let Ok(Some(field)) = multipart.next_field().await {
+        if field.name() == Some("file") {
+            match field.bytes().await {
+                Ok(bytes) => imported = Some(bytes),
+                Err(error) => return api_error(StatusCode::BAD_REQUEST, error.to_string()),
+            }
+        }
+    }
+    let Some(bytes) = imported else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "missing N1MM Call History file".into(),
+        );
+    };
+    match call_history::parse(&bytes, Utc::now()) {
+        Ok(import) => {
+            let diagnostics = import.diagnostics.clone();
+            let mut runtime = state.runtime.write().await;
+            runtime.call_history = import.entries;
+            runtime.call_history_diagnostics = diagnostics.clone();
+            let enabled = !runtime.call_history.is_empty();
+            runtime
+                .source_policy
+                .set_enabled(SourceId::N1mmCallHistory, enabled);
             drop(runtime);
             state.updates.send(()).ok();
             Json(json!({"ok": true, "diagnostics": diagnostics})).into_response()
@@ -1049,6 +1138,7 @@ fn demo_runtime(spots_enabled: bool, spot_policy: SpotPolicy, scenario: DemoScen
     ]);
     let mut runtime = Runtime {
         qsos,
+        call_history: BTreeMap::new(),
         spots,
         operations: vec![Operation {
             id: "demo-naqp".into(),
@@ -1067,6 +1157,7 @@ fn demo_runtime(spots_enabled: bool, spot_policy: SpotPolicy, scenario: DemoScen
         lofi_status: "demo mode; LoFi can still be linked below".into(),
         lofi_account_call: None,
         import_diagnostics: adif::ImportDiagnostics::default(),
+        call_history_diagnostics: call_history::ImportDiagnostics::default(),
         source_diagnostics: Vec::new(),
         spot_status: if spots_enabled {
             "demo candidates; live connection starting".into()
@@ -1273,6 +1364,61 @@ mod tests {
                 && source.enabled
                 && source.capability == model::SourceCapability::LocalLog
         }));
+    }
+
+    #[test]
+    fn call_history_is_prediction_only_and_local_qso_exchange_wins() {
+        let mut runtime = demo_runtime(false, SpotPolicy::default(), DemoScenario::Normal);
+        let imported_at = Utc.with_ymd_and_hms(2026, 8, 1, 17, 0, 0).unwrap();
+        runtime.call_history.extend([
+            (
+                "W1AW".into(),
+                call_history::CallHistoryEntry {
+                    call: "W1AW".into(),
+                    name: Some("OLD NAME".into()),
+                    location: Some("MA".into()),
+                    imported_at,
+                },
+            ),
+            (
+                "K1ABC".into(),
+                call_history::CallHistoryEntry {
+                    call: "K1ABC".into(),
+                    name: Some("PAT".into()),
+                    location: Some("RI".into()),
+                    imported_at,
+                },
+            ),
+        ]);
+        runtime
+            .source_policy
+            .set_enabled(SourceId::N1mmCallHistory, true);
+
+        let public = runtime.public();
+        let worked = public
+            .station_intelligence
+            .iter()
+            .find(|station| station.call == "W1AW")
+            .unwrap();
+        assert_eq!(worked.name.value.as_deref(), Some("AL"));
+        assert_eq!(worked.name.confidence, NameConfidence::Verified);
+        assert_eq!(worked.name.conflicts[0].value, "OLD NAME");
+        assert_eq!(worked.location.value.as_deref(), Some("CT"));
+        assert_eq!(worked.location.confidence, LocationConfidence::Verified);
+        assert_eq!(worked.location.conflicts[0].value, "MA");
+
+        let historical = public
+            .station_intelligence
+            .iter()
+            .find(|station| station.call == "K1ABC")
+            .unwrap();
+        assert_eq!(
+            historical.participation.confidence,
+            ParticipationConfidence::Unknown
+        );
+        assert_eq!(historical.name.confidence, NameConfidence::History);
+        assert_eq!(historical.location.confidence, LocationConfidence::History);
+        assert_eq!(public.assisted_warning, None);
     }
 
     #[test]

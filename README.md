@@ -141,6 +141,20 @@ dashboard's import target, or focus it and press Enter to select a file. The par
 `CONTEST_ID`, and `SRX_STRING`. PoLo's `SRX_STRING` form (`<name> <location>`) is used as
 an exchange fallback. Re-importing a growing snapshot is idempotent.
 
+## N1MM Call History
+
+Export or prepare an N1MM Call History text file with an `!!Order!!` header and drop it
+onto the dashboard's Call History target. Sidecar maps `Call`, `Name`, and `State` by
+column name, accepts comma- or semicolon-delimited files, ignores comments and unknown
+columns, and reports malformed rows without discarding usable entries.
+
+Call History is static historical evidence. Its names and locations are exposed as
+**history** predictions, never proof that a callsign is participating in the current
+contest. An exchange from a completed local QSO always takes precedence, while a
+conflicting historical value remains visible in the API evidence. The imported history
+is held for the current Sidecar session and can be replaced atomically by importing a
+new file.
+
 ## Live CW spots and entry category
 
 Sidecar does not connect to a spotting network by default, keeping its normal startup

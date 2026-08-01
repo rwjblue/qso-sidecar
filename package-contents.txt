@@ -8,6 +8,7 @@ docs/naqp-rules.md
 docs/polo-integration.md
 docs/rbn-pipeline.md
 src/adif.rs
+src/call_history.rs
 src/lofi.rs
 src/log_source.rs
 src/main.rs
@@ -20,3 +21,4 @@ src/static/app.js
 src/static/index.html
 src/static/responsive.css
 src/storage.rs
+tests/fixtures/n1mm-naqp-call-history.txt

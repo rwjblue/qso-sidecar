@@ -260,6 +260,14 @@ pub enum LocationConfidence {
     Verified,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameConfidence {
+    Unknown,
+    History,
+    Verified,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParticipationEvidence {
     pub confidence: ParticipationConfidence,
@@ -290,6 +298,21 @@ impl LocationEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NameEvidence {
+    pub value: String,
+    pub confidence: NameConfidence,
+    pub source: EvidenceSource,
+    pub observed_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl NameEvidence {
+    pub fn is_fresh(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at.is_none_or(|expires_at| expires_at > now)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParticipationConclusion {
     pub confidence: ParticipationConfidence,
     pub evidence: Vec<ParticipationEvidence>,
@@ -304,9 +327,18 @@ pub struct LocationConclusion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NameConclusion {
+    pub value: Option<String>,
+    pub confidence: NameConfidence,
+    pub evidence: Vec<NameEvidence>,
+    pub conflicts: Vec<NameEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StationEvidence {
     pub call: String,
     pub participation: Vec<ParticipationEvidence>,
+    pub names: Vec<NameEvidence>,
     pub locations: Vec<LocationEvidence>,
 }
 
@@ -315,6 +347,7 @@ impl StationEvidence {
         Self {
             call: call.into().trim().to_ascii_uppercase(),
             participation: Vec::new(),
+            names: Vec::new(),
             locations: Vec::new(),
         }
     }
@@ -361,6 +394,37 @@ impl StationEvidence {
                 .collect()
         });
         LocationConclusion {
+            value,
+            confidence,
+            evidence,
+            conflicts,
+        }
+    }
+
+    pub fn name_at(&self, now: DateTime<Utc>) -> NameConclusion {
+        let evidence: Vec<_> = self
+            .names
+            .iter()
+            .filter(|item| item.is_fresh(now))
+            .cloned()
+            .collect();
+        let selected = evidence
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, item)| (item.confidence, item.observed_at, *index))
+            .map(|(_, item)| item);
+        let value = selected.map(|item| item.value.clone());
+        let confidence = selected
+            .map(|item| item.confidence)
+            .unwrap_or(NameConfidence::Unknown);
+        let conflicts = selected.map_or_else(Vec::new, |selected| {
+            evidence
+                .iter()
+                .filter(|item| !item.value.eq_ignore_ascii_case(&selected.value))
+                .cloned()
+                .collect()
+        });
+        NameConclusion {
             value,
             confidence,
             evidence,
@@ -531,6 +595,32 @@ mod evidence_tests {
         assert_eq!(conclusion.evidence.len(), 2);
         assert_eq!(conclusion.conflicts.len(), 1);
         assert_eq!(conclusion.conflicts[0].value, "MA");
+    }
+
+    #[test]
+    fn completed_local_qso_name_outranks_history() {
+        let mut station = StationEvidence::new("K1ABC");
+        station.names.extend([
+            NameEvidence {
+                value: "Pat".into(),
+                confidence: NameConfidence::History,
+                source: EvidenceSource::CallHistory,
+                observed_at: time(8),
+                expires_at: None,
+            },
+            NameEvidence {
+                value: "Alex".into(),
+                confidence: NameConfidence::Verified,
+                source: EvidenceSource::LocalQso,
+                observed_at: time(1),
+                expires_at: None,
+            },
+        ]);
+
+        let conclusion = station.name_at(time(10));
+        assert_eq!(conclusion.value.as_deref(), Some("Alex"));
+        assert_eq!(conclusion.confidence, NameConfidence::Verified);
+        assert_eq!(conclusion.conflicts[0].value, "Pat");
     }
 
     #[test]
