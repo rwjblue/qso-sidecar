@@ -185,12 +185,13 @@ Call History file is shown separately as a **history match** (`~`), because hist
 not prove current participation or a correct current exchange. An arbitrary RBN callsign
 without either source remains **unknown**.
 
-The default **Focus** view limits the queue to fresh, unworked candidates on the current
-band. Candidate ordering favors the current band, stronger evidence, configured preferred
-skimmers, independent skimmer count, report count, and recency. Use **Hold list** while
-reading; incoming candidates are counted until they are released into the list. The RBN
-relay does not support server-side filters, so nearby skimmers can be prioritized locally
-by callsign:
+The default **Current band** view is a multiplier decision queue, not a general spot
+browser. It includes only fresh, unworked calls that resolve to an unworked multiplier,
+groups multiple stations for the same multiplier behind the best candidate, and excludes
+reports older than five minutes. Ranking favors tactical freshness, multiplier evidence,
+nearby receiver-site corroboration, recent SNR, and repeat reports. **All bands** preserves
+that multiplier-focused ranking; **All spots** is the diagnostic feed. Use **Hold** while
+tuning; incoming candidates are counted until the queue is released.
 
 ```bash
 QSO_SIDECAR_CALL=N1RWJ mise run start -- --rbn \
@@ -204,12 +205,32 @@ derived coverage distance and can switch between **Nearby** and **All RBN** with
 changing the Assisted entry warning:
 
 ```bash
-QSO_SIDECAR_CALL=N1RWJ mise run start -- --rbn --station-grid FN31PR
+QSO_SIDECAR_CALL=N1RWJ mise run start -- --rbn --station-grid FN41FR
 ```
 
 Multiple skimmer processes at the same advertised grid count as one receiver site for
 selection. If the node directory is unavailable, Sidecar uses a recent cached copy or
 visibly falls back to the full feed; the station grid is never sent to RBN.
+
+### Optional QRZ estimates
+
+An active [QRZ XML Callbook subscription](https://www.qrz.com/docs/xml/current_spec.html)
+can fill in US-state estimates for fresh nearby calls that have no stronger location
+evidence. QRZ lookups are explicitly opt-in and require both credentials:
+
+```bash
+QSO_SIDECAR_CALL=N1RWJ \
+QSO_SIDECAR_QRZ_USERNAME=your-qrz-user \
+QSO_SIDECAR_QRZ_PASSWORD=your-qrz-password \
+mise run start -- --rbn --station-grid FN41FR --qrz
+```
+
+Sidecar looks up only calls already heard by a selected nearby receiver, deduplicates
+them for the process lifetime, spaces requests, and keeps the QRZ session key and lookup
+results in memory. Passwords and session keys are never logged. QRZ represents a callbook
+address rather than the station's current contest exchange, so a result is always labeled
+**QRZ estimate** and can never award score or verified multiplier credit. QRZ does not
+provide a Canadian province field; Sidecar does not guess one from mailing-address text.
 
 See [`docs/rbn-pipeline.md`](docs/rbn-pipeline.md) for aggregation, expiry, ranking, and
 the classification evidence policy.
@@ -232,6 +253,9 @@ CLI flags also have environment-variable equivalents:
 | `--station-grid` | `QSO_SIDECAR_STATION_GRID` | none |
 | `--rbn-skimmer-scope` | `QSO_SIDECAR_RBN_SKIMMER_SCOPE` | `nearby` with a grid, otherwise `all` |
 | `--rbn-nearest-sites` | `QSO_SIDECAR_RBN_NEAREST_SITES` | `3` |
+| `--qrz` | `QSO_SIDECAR_QRZ` | false |
+| `--qrz-username` | `QSO_SIDECAR_QRZ_USERNAME` | required with `--qrz` |
+| `--qrz-password` | `QSO_SIDECAR_QRZ_PASSWORD` | required with `--qrz` |
 | `--demo` | `QSO_SIDECAR_DEMO` | false |
 | `--demo-scenario` | `QSO_SIDECAR_DEMO_SCENARIO` | `normal` |
 | `--lofi-base` | `QSO_SIDECAR_LOFI_BASE` | `https://lofi.ham2k.net` |

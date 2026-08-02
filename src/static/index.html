@@ -49,14 +49,14 @@
 
       <aside class="right-column">
         <section class="panel spots-panel">
-          <div class="panel-head"><div><p class="eyebrow">REVERSE BEACON NETWORK</p><h2>Fresh CW candidates</h2></div><span id="spot-status" class="status-dot">● —</span></div>
-          <div id="participant-summary" class="participant-summary" aria-label="Participant confidence summary"></div>
+          <div class="panel-head"><div><p class="eyebrow">S&amp;P DECISION QUEUE</p><h2>Best multiplier opportunities</h2></div><span id="spot-status" class="status-dot">● —</span></div>
+          <div id="participant-summary" class="participant-summary" aria-label="Current band multiplier opportunity summary"></div>
           <div class="locality-bar">
             <div id="spot-scope" class="scope-toggle" role="group" aria-label="RBN receiver scope"><button data-scope="nearby" type="button">Nearby</button><button data-scope="all" type="button">All RBN</button></div>
             <span id="locality-status" class="muted">All RBN receivers</span>
           </div>
-          <div id="spot-filters" class="filters" role="group" aria-label="Spot filters">
-            <button data-filter="focus" class="active" aria-pressed="true">Focus</button><button data-filter="confirmed" aria-pressed="false">Confirmed</button><button data-filter="probable" aria-pressed="false">Probable</button><button data-filter="multipliers" aria-pressed="false">Mults</button><button data-filter="all" aria-pressed="false">All</button><button id="spot-hold" class="spot-hold" type="button">Hold</button>
+          <div id="spot-filters" class="filters" role="group" aria-label="Multiplier opportunity filters">
+            <button data-filter="best" class="active" aria-pressed="true">Current band</button><button data-filter="bands" aria-pressed="false">All bands</button><button data-filter="all" aria-pressed="false">All spots</button><button id="spot-hold" class="spot-hold" type="button">Hold</button>
           </div>
           <div id="spots" class="spots" aria-live="off"></div>
         </section>
@@ -65,6 +65,7 @@
           <p id="source" class="source-name">Waiting for data</p>
           <p id="source-capabilities" class="muted">Active sources: offline reference</p>
           <p id="lofi-status" class="muted">—</p>
+          <p id="qrz-status" class="muted">QRZ enrichment disabled</p>
           <form id="link-form" class="inline-form"><label for="email">PoLo account email</label><div><input id="email" type="email" autocomplete="email" placeholder="you@example.com" required><button>Send link</button></div></form>
           <label for="operation" class="field-label">Operation</label><select id="operation"><option value="">No operation loaded</option></select>
           <div id="drop-zone" class="drop-zone" tabindex="0" role="button" aria-describedby="import-note">↥ <strong>Drop current PoLo ADIF here</strong><span>or press Enter to choose a file</span></div>

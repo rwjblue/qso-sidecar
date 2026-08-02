@@ -3,8 +3,10 @@ mod call_history;
 mod lofi;
 mod log_source;
 mod model;
+mod mult_finder;
 mod naqp;
 mod naqp_catalog;
+mod qrz;
 mod rbn;
 mod rbn_locality;
 mod storage;
@@ -100,6 +102,15 @@ struct Args {
     /// Number of distinct nearby RBN receiver sites selected per band.
     #[arg(long, default_value_t = 3, env = "QSO_SIDECAR_RBN_NEAREST_SITES")]
     rbn_nearest_sites: usize,
+    /// Enable demand-driven QRZ XML lookups for fresh nearby RBN calls.
+    #[arg(long, env = "QSO_SIDECAR_QRZ")]
+    qrz: bool,
+    /// QRZ username for XML Callbook API authentication.
+    #[arg(long, env = "QSO_SIDECAR_QRZ_USERNAME", hide_env_values = true)]
+    qrz_username: Option<String>,
+    /// QRZ password for XML Callbook API authentication.
+    #[arg(long, env = "QSO_SIDECAR_QRZ_PASSWORD", hide_env_values = true)]
+    qrz_password: Option<String>,
     /// Override the LoFi API base for development.
     #[arg(
         long,
@@ -203,6 +214,30 @@ fn validate_rbn_config(rbn_enabled: bool, call: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn qrz_config(args: &Args) -> Result<Option<qrz::Config>> {
+    if !args.qrz {
+        return Ok(None);
+    }
+    let username = args
+        .qrz_username
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let password = args
+        .qrz_password
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    ensure!(
+        username.is_some() && password.is_some(),
+        "QRZ enrichment requires QSO_SIDECAR_QRZ_USERNAME and QSO_SIDECAR_QRZ_PASSWORD"
+    );
+    Ok(Some(qrz::Config::new(
+        username.unwrap().to_owned(),
+        password.unwrap().to_owned(),
+    )))
+}
+
 fn http_trace_path(uri: &Uri) -> &str {
     uri.path()
 }
@@ -236,6 +271,7 @@ struct AppState {
     shutdown: broadcast::Sender<()>,
     lofi: lofi::LofiClient,
     store: storage::StateStore,
+    qrz_tx: Option<mpsc::Sender<String>>,
 }
 
 #[derive(Debug)]
@@ -260,6 +296,7 @@ struct Runtime {
     demo: bool,
     goals: OperatorGoals,
     rbn_locality: rbn_locality::RbnLocality,
+    qrz_status: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -272,6 +309,8 @@ struct PublicState {
     spots: Vec<Spot>,
     all_spots: Vec<Spot>,
     nearby_spots: Vec<Spot>,
+    nearby_mult_opportunities: Vec<mult_finder::MultOpportunity>,
+    all_mult_opportunities: Vec<mult_finder::MultOpportunity>,
     rbn_locality: rbn_locality::PublicLocality,
     operations: Vec<Operation>,
     selected_operation: Option<String>,
@@ -295,6 +334,7 @@ struct PublicState {
     problem_findings: Vec<ProblemFinding>,
     rate_guidance: RateGuidance,
     goals: OperatorGoals,
+    qrz_status: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -463,6 +503,7 @@ impl Runtime {
                 demo: false,
                 goals: restored.goals,
                 rbn_locality: rbn_locality::RbnLocality::default(),
+                qrz_status: "disabled".into(),
             };
         }
         Self {
@@ -486,6 +527,7 @@ impl Runtime {
             demo: false,
             goals: OperatorGoals::default(),
             rbn_locality: rbn_locality::RbnLocality::default(),
+            qrz_status: "disabled".into(),
         }
     }
 
@@ -525,6 +567,34 @@ impl Runtime {
         } else {
             all_spots.clone()
         };
+        let evidence = station_evidence(
+            self.qsos.values(),
+            self.call_history.values(),
+            self.external_station_evidence.values(),
+            self.spots.iter(),
+            generated_at,
+            self.spot_policy.ttl,
+        );
+        let locations = evidence
+            .iter()
+            .map(|(call, station)| (call.clone(), station.location_at(generated_at)))
+            .collect();
+        let nearby_mult_opportunities = mult_finder::opportunities(
+            &score,
+            &nearby_spots,
+            &locations,
+            current_band,
+            generated_at,
+            true,
+        );
+        let all_mult_opportunities = mult_finder::opportunities(
+            &score,
+            &all_spots,
+            &locations,
+            current_band,
+            generated_at,
+            false,
+        );
         let multiplier_matrix = build_multiplier_matrix(&score, &spots);
         let mut source_policy = self.source_policy.clone();
         source_policy.set_enabled(
@@ -575,6 +645,8 @@ impl Runtime {
             spots,
             all_spots,
             nearby_spots,
+            nearby_mult_opportunities,
+            all_mult_opportunities,
             rbn_locality: self.rbn_locality.public(),
             operations: self.operations.clone(),
             selected_operation: self.selected_operation.clone(),
@@ -605,6 +677,7 @@ impl Runtime {
             problem_findings,
             rate_guidance,
             goals: self.goals.clone(),
+            qrz_status: self.qrz_status.clone(),
         }
     }
 
@@ -1200,6 +1273,7 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     validate_rbn_config(args.rbn, args.call.as_deref())?;
+    let qrz_config = qrz_config(&args)?;
     let spot_policy = args.spot_policy()?;
     let mut rbn_locality = args.rbn_locality()?;
     let locality_cache = rbn_locality::CatalogCache::for_app()?;
@@ -1228,13 +1302,32 @@ async fn main() -> Result<()> {
         Runtime::normal(args.rbn, spot_policy, restored)
     };
     runtime.rbn_locality = rbn_locality;
+    runtime
+        .source_policy
+        .set_enabled(SourceId::QrzCallbook, qrz_config.is_some());
+    runtime.qrz_status = if qrz_config.is_some() {
+        "enabled — waiting for a fresh unresolved nearby call".into()
+    } else {
+        "disabled".into()
+    };
+    let (qrz_tx, qrz_rx) = if qrz_config.is_some() {
+        let (tx, rx) = mpsc::channel(128);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let state = AppState {
         runtime: Arc::new(RwLock::new(runtime)),
         updates,
         shutdown: shutdown.clone(),
         lofi,
         store,
+        qrz_tx,
     };
+
+    if let (Some(config), Some(rx)) = (qrz_config, qrz_rx) {
+        spawn_qrz_worker(state.clone(), config, rx)?;
+    }
 
     tokio::spawn(run_lofi_sync(state.clone()));
     if args.rbn {
@@ -1701,12 +1794,121 @@ fn spawn_cluster(state: AppState, address: String, login_call: Option<String>) {
                 rbn::ClusterEvent::Status { state, message } => {
                     update_cluster_status(&mut runtime, state, message)
                 }
-                rbn::ClusterEvent::Spot(raw) => merge_spot(&mut runtime, raw),
+                rbn::ClusterEvent::Spot(raw) => {
+                    let qrz_candidate = state
+                        .qrz_tx
+                        .as_ref()
+                        .and_then(|_| needs_qrz_lookup(&runtime, &raw).then(|| raw.call.clone()));
+                    merge_spot(&mut runtime, raw);
+                    if let (Some(call), Some(qrz_tx)) = (qrz_candidate, state.qrz_tx.as_ref())
+                        && qrz_tx.try_send(call).is_err()
+                    {
+                        runtime.qrz_status = "degraded — lookup queue is full".into();
+                    }
+                }
             }
             drop(runtime);
             state.updates.send(()).ok();
         }
     });
+}
+
+fn spawn_qrz_worker(
+    state: AppState,
+    config: qrz::Config,
+    mut rx: mpsc::Receiver<String>,
+) -> Result<()> {
+    let mut client = qrz::Client::new(config)?;
+    tokio::spawn(async move {
+        let mut seen = BTreeSet::new();
+        while let Some(call) = rx.recv().await {
+            let call = model::normalize_call(&call);
+            if !seen.insert(call.clone()) {
+                continue;
+            }
+            {
+                let mut runtime = state.runtime.write().await;
+                runtime.qrz_status = format!("looking up {call}");
+            }
+            state.updates.send(()).ok();
+            match client.lookup(&call).await {
+                Ok(Some(lookup)) => {
+                    let multiplier = qrz_multiplier(&lookup, &call);
+                    let mut runtime = state.runtime.write().await;
+                    if let Some(multiplier) = multiplier {
+                        let observed_at = Utc::now();
+                        let mut station = StationEvidence::new(&call);
+                        station.locations.push(LocationEvidence {
+                            value: multiplier.code.to_owned(),
+                            confidence: LocationConfidence::Callbook,
+                            source: EvidenceSource::Callbook,
+                            observed_at,
+                            expires_at: Some(observed_at + chrono::Duration::hours(24)),
+                        });
+                        runtime
+                            .external_station_evidence
+                            .insert(call.clone(), station);
+                        runtime.qrz_status =
+                            format!("live — {call} estimated as {} from QRZ", multiplier.code);
+                    } else {
+                        runtime.qrz_status = format!(
+                            "live — {call} has no QRZ location usable as an NAQP multiplier"
+                        );
+                    }
+                }
+                Ok(None) => {
+                    state.runtime.write().await.qrz_status =
+                        format!("live — {call} was not found in QRZ");
+                }
+                Err(error) => {
+                    warn!(call = %call, %error, "QRZ lookup failed");
+                    state.runtime.write().await.qrz_status =
+                        format!("degraded — QRZ lookup failed for {call}");
+                }
+            }
+            state.updates.send(()).ok();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+    Ok(())
+}
+
+fn needs_qrz_lookup(runtime: &Runtime, raw: &rbn::RawSpot) -> bool {
+    if runtime
+        .rbn_locality
+        .match_spotter(raw.band, &raw.spotter)
+        .is_none()
+        || runtime.qsos.values().any(|qso| {
+            !qso.deleted
+                && qso.band == Some(raw.band)
+                && model::calls_equivalent(&qso.call, &raw.call)
+        })
+    {
+        return false;
+    }
+    let evidence = station_evidence(
+        runtime.qsos.values(),
+        runtime.call_history.values(),
+        runtime.external_station_evidence.values(),
+        runtime.spots.iter(),
+        raw.time,
+        runtime.spot_policy.ttl,
+    );
+    evidence
+        .values()
+        .find(|station| model::calls_equivalent(&station.call, &raw.call))
+        .is_none_or(|station| {
+            station.location_at(raw.time).confidence < LocationConfidence::History
+        })
+}
+
+fn qrz_multiplier(
+    lookup: &qrz::Lookup,
+    requested_call: &str,
+) -> Option<&'static naqp_catalog::MultiplierDefinition> {
+    let state = lookup.state.as_deref()?;
+    let code = naqp::normalize_multiplier(state)?;
+    naqp_catalog::resolve(&code, requested_call, lookup.country.as_deref())
 }
 
 fn spawn_locality_refresh(state: AppState, cache: rbn_locality::CatalogCache) {
@@ -2119,6 +2321,7 @@ fn demo_runtime(spots_enabled: bool, spot_policy: SpotPolicy, scenario: DemoScen
             score: Some(50_000),
         },
         rbn_locality: rbn_locality::RbnLocality::default(),
+        qrz_status: "disabled".into(),
     };
     match scenario {
         DemoScenario::Normal => {}
@@ -2731,6 +2934,26 @@ mod tests {
     }
 
     #[test]
+    fn qrz_requires_credentials_only_when_enabled() {
+        let disabled = Args::try_parse_from(["qso-sidecar"]).unwrap();
+        assert!(qrz_config(&disabled).unwrap().is_none());
+
+        let missing = Args::try_parse_from(["qso-sidecar", "--qrz"]).unwrap();
+        assert!(qrz_config(&missing).is_err());
+
+        let enabled = Args::try_parse_from([
+            "qso-sidecar",
+            "--qrz",
+            "--qrz-username",
+            "operator",
+            "--qrz-password",
+            "secret",
+        ])
+        .unwrap();
+        assert!(qrz_config(&enabled).unwrap().is_some());
+    }
+
+    #[test]
     fn preferred_rbn_spotters_are_normalized() {
         let args =
             Args::try_parse_from(["qso-sidecar", "--preferred-rbn-spotters", "wz7i-#, K3LR"])
@@ -2998,6 +3221,37 @@ mod tests {
             classify_spot(&runtime, "K9XYZ", Band::B20),
             (SpotClass::PredictedMultiplier, Some("NV".into()))
         );
+    }
+
+    #[test]
+    fn qrz_state_is_predicted_and_never_verified() {
+        let mut runtime = Runtime::normal(false, SpotPolicy::default(), None);
+        let observed_at = Utc::now();
+        let mut station = StationEvidence::new("K1QRZ");
+        station.locations.push(LocationEvidence {
+            value: "MA".into(),
+            confidence: LocationConfidence::Callbook,
+            source: EvidenceSource::Callbook,
+            observed_at,
+            expires_at: Some(observed_at + chrono::Duration::hours(24)),
+        });
+        runtime
+            .external_station_evidence
+            .insert("K1QRZ".into(), station);
+
+        assert_eq!(
+            classify_spot(&runtime, "K1QRZ", Band::B20),
+            (SpotClass::PredictedMultiplier, Some("MA".into()))
+        );
+        let lookup = qrz::Lookup {
+            call: "K1QRZ".into(),
+            state: Some("MA".into()),
+            country: Some("United States".into()),
+            dxcc: Some(291),
+            grid: Some("FN42".into()),
+            geoloc: Some("grid".into()),
+        };
+        assert_eq!(qrz_multiplier(&lookup, "K1QRZ").unwrap().code, "MA");
     }
 
     #[test]

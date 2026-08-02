@@ -114,6 +114,7 @@ pub enum EvidenceSource {
 #[serde(rename_all = "snake_case")]
 pub enum SourceId {
     ReverseBeaconNetwork,
+    QrzCallbook,
     ContestOnlineScoreboard,
     N1mmCallHistory,
     PoloLofi,
@@ -155,6 +156,12 @@ impl Default for SourcePolicy {
             (
                 SourceId::ContestOnlineScoreboard,
                 "Contest Online ScoreBoard",
+                SourceCapability::LiveExternalAssistance,
+                false,
+            ),
+            (
+                SourceId::QrzCallbook,
+                "QRZ XML Callbook",
                 SourceCapability::LiveExternalAssistance,
                 false,
             ),
