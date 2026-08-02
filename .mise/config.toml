@@ -1,3 +1,5 @@
 [tools]
 rust = "stable"
 
+[env]
+_.file = { path = ".env", redact = true }
